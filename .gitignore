@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+# raw logs from this machine stay private (publish only an anonymized sample later)
+data/
+reports/
+daemon/target/
+*.pyc
+*.swp
+*~
+.env
+.claude/
