@@ -1,0 +1,25 @@
+[Unit]
+Description=t2opt-fand: model-predictive fan and power control (T2 MacBook)
+Documentation=file://@REPO@/daemon/src/main.rs
+# fand owns the fans, the CPU power limits and the dGPU cap
+Conflicts=@UNITS@
+# install-service.sh fills in the repo path and the units to replace
+# runs from the repo: rebuild, then `systemctl restart t2opt-fand`
+RequiresMountsFor=@REPO@
+# after repeated failures, the old services take over again
+StartLimitIntervalSec=300
+StartLimitBurst=5
+OnFailure=@UNITS@
+
+[Service]
+Type=notify
+ExecStart=@REPO@/daemon/target/release/t2opt-fand
+# any stop, crash or watchdog kill hands the fans back to the SMC
+ExecStopPost=@REPO@/daemon/target/release/t2opt-fand --release
+WatchdogSec=15
+Restart=on-failure
+RestartSec=5
+Nice=-5
+
+[Install]
+WantedBy=multi-user.target

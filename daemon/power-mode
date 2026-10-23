@@ -1,0 +1,70 @@
+#!/bin/bash
+# Pick t2opt-fand's power mode. Each mode is a fan ceiling; fand caps CPU and
+# dGPU power so the SMC's skin budget holds under it (fand.toml has the values).
+#
+#   power-mode                     show the current mode
+#   power-mode eco|balanced|perf   switch to it
+#   power-mode toggle              eco -> balanced -> perf -> eco
+#   power-mode --json              current mode as Touch Bar widget JSON
+#
+# No root needed: the mode file is group wheel. While fand isn't running this
+# hands over to FALLBACK_CMD from local.env, if set.
+
+set -u
+
+MODE_FILE=/run/t2opt-fand/mode
+# fand writes its status file every second and removes it on exit
+STATUS=/run/t2opt-fand.json
+
+if [[ ! -e $STATUS ]]; then
+  # may be run through a symlink (e.g. ~/.local/bin/power-mode)
+  REPO=$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")
+  [[ -f $REPO/local.env ]] && . "$REPO/local.env"
+  [[ -n ${FALLBACK_CMD:-} ]] && exec "$FALLBACK_CMD" "$@"
+  echo "t2opt-fand isn't running" >&2
+  exit 1
+fi
+
+current() {
+  local m
+  m=$(cat "$MODE_FILE" 2>/dev/null)
+  case $m in
+    eco | balanced | perf) echo "$m" ;;
+    *) echo balanced ;;
+  esac
+}
+
+switch() {
+  echo "$1" > "$MODE_FILE" || exit 1
+  local icon text
+  case $1 in
+    eco) icon=power-profile-power-saver-symbolic text="Quiet fans; power capped to stay under them" ;;
+    balanced) icon=power-profile-balanced-symbolic text="Moderate fans; power capped above that" ;;
+    perf) icon=power-profile-performance-symbolic text="Fans up to max; power capped only by the SMC budget" ;;
+  esac
+  # Replaces the previous switch notification instead of stacking.
+  notify-send -a "Power mode" -i "$icon" \
+    -h string:x-canonical-private-synchronous:power-profile \
+    "${1^}" "$text" 2>/dev/null
+  return 0
+}
+
+case ${1:-} in
+  "") current ;;
+  eco | balanced | perf) switch "$1" ;;
+  toggle)
+    case $(current) in
+      eco) switch balanced ;;
+      balanced) switch perf ;;
+      *) switch eco ;;
+    esac
+    ;;
+  --json)
+    case $(current) in
+      eco) echo '{"text":"eco"}' ;;
+      balanced) echo '{"text":"bal"}' ;;
+      perf) echo '{"text":"perf","icon":"bolt"}' ;;
+    esac
+    ;;
+  *) echo "usage: power-mode [eco|balanced|perf|toggle|--json]" >&2; exit 2 ;;
+esac

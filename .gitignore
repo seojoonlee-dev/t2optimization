@@ -9,3 +9,6 @@ daemon/target/
 *~
 .env
 .claude/
+# this machine's settings (see the .example files)
+local.env
+daemon/fand.local.toml

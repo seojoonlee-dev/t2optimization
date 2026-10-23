@@ -7,9 +7,9 @@ logger (tools/logger.py, run separately) sees varied power and fan inputs
 without waking anyone.
 
 Noise ceiling = what t2fanrd runs at 75 °C (~3100 rpm, measured 2026-10-19).
-To avoid PL2 bursts at load starts, dgpu-powercap is paused for the run and
-each phase gets a flat cap (PL1 = PL2); dGPU phases get the 'low' DPM level,
-as dgpu-powercap would apply.
+To avoid PL2 bursts at load starts, other power-limit services (EXTRA_UNITS
+in local.env) are paused for the run and each phase gets a flat cap
+(PL1 = PL2); dGPU phases get the 'low' DPM level.
 
 The caps are chosen to stay clear of the ceiling: 14 W RAPL (~18.5 W PC0R)
 settled at 2400-2600 rpm under t2fanrd on 2026-10-19, so steady phases should
@@ -22,8 +22,8 @@ TS1S_LIMIT, any SMC throttle -> all load stops, fans go back to t2fanrd, and
 the machine idles for GUARD_COOLDOWN before the schedule resumes.
 
 On exit (end, SIGTERM, crash via the launcher's ExecStopPost --cleanup):
-no loads, t2fanrd + dgpu-powercap running (they re-apply fans, RAPL and the
-dGPU level), suspend unmasked.
+no loads, t2fanrd + EXTRA_UNITS running (they re-apply fans and power
+limits), suspend unmasked.
 
     python3 tools/overnight.py --plan [hours]     print the schedule
 """
@@ -43,14 +43,14 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UID = os.stat(REPO).st_uid
 _PW = pwd.getpwuid(UID)
 USER = _PW.pw_name
-SMC = "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:102/APP0001:00"
+# applesmc binds to the T2's ACPI SMC device
+SMC = "/sys/bus/acpi/devices/APP0001:00"
 RAPL = "/sys/class/powercap/intel-rapl:0"
-DGPU_STATUS = "/sys/bus/pci/devices/0000:01:00.0/power/runtime_status"
-DPM_APPLY = "/usr/local/bin/set-amdgpu-dpm.sh"
+# other power-limit services, from local.env via overnight-start.sh
+EXTRA_UNITS = os.environ.get("EXTRA_UNITS", "").split()
 SLEEP_TARGETS = ["sleep.target", "suspend.target", "hibernate.target",
                  "hybrid-sleep.target", "suspend-then-hibernate.target"]
-UENV = {"XDG_RUNTIME_DIR": f"/run/user/{UID}", "WAYLAND_DISPLAY": "wayland-1",
-        "HOME": _PW.pw_dir, "PATH": "/usr/bin"}
+UENV = {"XDG_RUNTIME_DIR": f"/run/user/{UID}", "HOME": _PW.pw_dir, "PATH": "/usr/bin"}
 
 NOISE_RPM = 3100
 HARD_RPM = 3500
@@ -77,7 +77,7 @@ LEVELS = {
 WEIGHTS = {"idle": 4, "cpu1": 1, "cpu2": 2, "cpu4": 2, "cpu8": 1.5, "cpu16": 2,
            "igpu": 1.5, "igpu+cpu2": 1, "dgpu": 1.5, "dgpu+cpu2": 1}
 CAPS_W = [8, 10, 12, 14]
-DGPU_CAP_W = 10  # CPU cap while the dGPU works, as dgpu-powercap's dgpu profile
+DGPU_CAP_W = 10  # CPU cap while the dGPU works (they share the heatsink)
 FAN_OVERRIDES = [2400, 2700]
 
 
@@ -161,6 +161,32 @@ class LoggerTail:
         return None
 
 
+def amdgpu_dev():
+    """The dGPU's PCI device dir, or None."""
+    for c in glob.glob("/sys/class/drm/card*"):
+        try:
+            if os.path.basename(os.readlink(c + "/device/driver")) == "amdgpu":
+                return os.path.realpath(c + "/device")
+        except OSError:
+            pass
+
+
+def wayland_display():
+    """The user's compositor socket, e.g. wayland-1."""
+    socks = sorted(p for p in glob.glob(f"/run/user/{UID}/wayland-*") if not p.endswith(".lock"))
+    return os.path.basename(socks[0]) if socks else "wayland-0"
+
+
+def dgpu_low(dev):
+    """Stock overdrive table and the 'low' DPM level; only while it is awake."""
+    try:
+        wr(dev + "/pp_od_clk_voltage", "r")
+        wr(dev + "/pp_od_clk_voltage", "c")
+    except OSError:
+        pass  # overdrive off: the table is stock anyway
+    wr(dev + "/power_dpm_force_performance_level", "low")
+
+
 def fan_rpm():
     return max(int(rd(f"{SMC}/fan{n}_input")) for n in (1, 2))
 
@@ -181,7 +207,7 @@ def set_loads(threads, gpu):
     subprocess.run(["pkill", "-u", USER, "-x", "yes"])
     subprocess.run(["pkill", "-u", USER, "-f", "glmark2-wayland --off-screen"])
     if gpu:
-        env = dict(UENV)
+        env = dict(UENV, WAYLAND_DISPLAY=wayland_display())
         if gpu == "dgpu":
             env["DRI_PRIME"] = "1"
         procs.append(subprocess.Popen(
@@ -226,8 +252,8 @@ def cleanup(*_):
         return
     done = True
     set_loads(0, None)
-    # both re-apply their own state on start: fan curve, RAPL profile, dGPU level
-    subprocess.run(["systemctl", "start", "--no-block", "t2fanrd", "dgpu-powercap"])
+    # each re-applies its own state on start: fan curve, power limits
+    subprocess.run(["systemctl", "start", "--no-block", "t2fanrd", *EXTRA_UNITS])
     subprocess.run(["systemctl", "unmask", "--runtime", *SLEEP_TARGETS])
 
 
@@ -237,7 +263,9 @@ def main():
     smc = LoggerTail(time.time() - 120)
     pkg_temp = pkg_temp_path()
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    subprocess.run(["systemctl", "stop", "dgpu-powercap"])
+    if EXTRA_UNITS:
+        subprocess.run(["systemctl", "stop", *EXTRA_UNITS])
+    dgpu = amdgpu_dev()
 
     path = os.path.join(REPO, "data", time.strftime("workload-%Y%m%d-%H%M%S.csv"))
     log = open(path, "w", buffering=1)
@@ -256,7 +284,7 @@ def main():
             set_fans(fan)
             set_loads(threads, gpu)
             note("phase", level, cap, fan or "t2fanrd", secs)
-            dpm_done = gpu != "dgpu"
+            dpm_done = gpu != "dgpu" or dgpu is None
             awake_since = None
             recent_rpm = collections.deque(maxlen=GUARD_WINDOW)
             recent_temp = collections.deque(maxlen=GUARD_WINDOW)
@@ -264,11 +292,13 @@ def main():
             while time.monotonic() < end:
                 time.sleep(1)
                 if not dpm_done:
-                    if rd(DGPU_STATUS) == "active":
+                    if rd(dgpu + "/power/runtime_status") == "active":
                         awake_since = awake_since or time.monotonic()
                         if time.monotonic() - awake_since >= 3:
-                            subprocess.run([DPM_APPLY, "low"], stdout=subprocess.DEVNULL,
-                                           stderr=subprocess.DEVNULL)
+                            try:
+                                dgpu_low(dgpu)
+                            except OSError as e:
+                                print("dgpu-low:", e, flush=True)
                             note("dgpu-low", level)
                             dpm_done = True
                     else:

@@ -21,8 +21,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # the CSVs belong to whoever owns the checkout
 USER_UID = os.stat(REPO).st_uid
 OUT_DIR = os.path.join(REPO, "data")
-SMC = "/sys/devices/LNXSYSTM:00/LNXSYBUS:00/PNP0A08:00/device:102/APP0001:00"
-DGPU = "/sys/bus/pci/devices/0000:01:00.0"
+# applesmc binds to the T2's ACPI SMC device
+SMC = "/sys/bus/acpi/devices/APP0001:00"
 # temperatures, power rails, fans (current, voltage keys are not needed)
 WANT = {"T": ("sp78",), "P": ("flt", "sp87"), "F": ("flt", "ui8 ", "ui16")}
 
@@ -30,6 +30,16 @@ WANT = {"T": ("sp78",), "P": ("flt", "sp87"), "F": ("flt", "ui8 ", "ui16")}
 def rd(p):
     with open(p) as f:
         return f.read().strip()
+
+
+def amdgpu_dev():
+    """The dGPU's PCI device dir, or None."""
+    for c in glob.glob("/sys/class/drm/card*"):
+        try:
+            if os.path.basename(os.readlink(c + "/device/driver")) == "amdgpu":
+                return os.path.realpath(c + "/device")
+        except OSError:
+            pass
 
 
 def gt_dir():
@@ -61,6 +71,7 @@ def energy(zone):
 
 def main():
     gt = gt_dir()
+    dgpu = amdgpu_dev()
     idx_fd = os.open(SMC + "/key_at_index", os.O_WRONLY)
     data_fd = os.open(SMC + "/key_at_index_data", os.O_RDONLY)
     keys = []
@@ -112,7 +123,7 @@ def main():
             ",".join(
                 [time.strftime("%F %T"), f"{now[3]:.1f}", "0" if manual == "1" else "1", pkg, gfx,
                  rd(gt + "/rps_act_freq_mhz"), rd(gt + "/rps_cur_freq_mhz"),
-                 "1" if rd(DGPU + "/power/runtime_status") == "active" else "0"]
+                 "1" if dgpu and rd(dgpu + "/power/runtime_status") == "active" else "0"]
                 + row
             )
             + "\n"
