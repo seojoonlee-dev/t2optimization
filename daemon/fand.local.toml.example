@@ -1,0 +1,10 @@
+# This machine's settings on top of fand.toml. Copy to fand.local.toml (not in
+# git) and keep only what you need; any fand.toml key works here.
+
+# command that resets the dGPU to its stock DPM level and overdrive table; it
+# gets the argument "auto". Only needed if something else on this machine
+# sets custom overdrive tables (e.g. an undervolted gaming profile).
+# dgpu_dpm_cmd = "/usr/local/bin/set-amdgpu-dpm.sh"
+
+# dGPU cap restored when fand exits; the default is the driver's own default
+# dgpu_release_cap_w = 30.0

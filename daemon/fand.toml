@@ -1,0 +1,22 @@
+# fand settings. Anything left out uses the default in src/control.rs (Config).
+# Paths are relative to this file's directory.
+# Restart the daemon to apply changes.
+
+# rc3m-c: rc3-v1 + a memory node fed by PM0C (2026-10-20); rc3-v1 is the
+# fallback if this misbehaves
+model = "../models/rc3m-c.json"
+
+# Ts1S the plan must stay under. The SMC's budget set point is 44.989 °C, and
+# the model's 90 s error is ~0.4 °C rms, so 44.6 leaves about one sigma.
+ceiling_c = 44.6
+
+# fans never go below / above these (mean of the two fans, rpm);
+# the SMC's own range is ~2080-5708
+min_rpm = 0
+max_rpm = 99999
+
+# die-temperature floors: fans start rising at the first value and reach full
+# speed at the second, past any mode's fan ceiling; power caps are never cut
+# for die temperature (user, 2026-10-20)
+cpu_floor_c = [88.0, 98.0]
+gpu_floor_c = [85.0, 95.0]
