@@ -18,12 +18,14 @@
 //!
 //!     sudo daemon/fand-start.sh [--shadow]              (see that script)
 //!     t2opt-fand --replay data/x.csv [--trace]          offline, no root, no fans
+//!     t2opt-fand --sim data/x.csv [--from T] [--to T]   closed loop against the model (src/sim.rs)
 //!     t2opt-fand --release                              fans back to the SMC
 
 mod control;
 mod hw;
 mod linalg;
 mod model;
+mod sim;
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, LineWriter, Write};
@@ -104,7 +106,8 @@ fn read_mode() -> Option<Mode> {
 
 /// What the CPU cap means in RAPL terms: (PL1, PL2) in W.
 fn rapl_limits(cfg: &Config, cpu_cap_pc0r: f64) -> (f64, f64) {
-    let pl1 = pkg_from_pc0r(cpu_cap_pc0r).clamp(cfg.cpu_pl1_min_w, cfg.cpu_pl1_max_w);
+    // eco's energy budget may go under the thermal plan's floor
+    let pl1 = pkg_from_pc0r(cpu_cap_pc0r).clamp(cfg.cpu_pl1_min_w.min(cfg.eco_sustained_w), cfg.cpu_pl1_max_w);
     (pl1, pl1 + cfg.pl2_extra_w)
 }
 
@@ -163,14 +166,16 @@ fn write_status(mode: &str, ctl: &Controller, r: &Reading) {
     }
 }
 
-const CSV_HEAD: &str =
-    "timestamp,unix_time,mode,cmd_rpm,reason,pred_ts1s_max,kf_ambient,kf_H,kf_C,kf_S,replica_bias,power_mode,fan_ceiling,cpu_pl1_w,dgpu_cap_w,dgpu_active,rapl_pkg_w,rapl_core_w,igpu_act_mhz,igpu_req_mhz";
+const CSV_HEAD: &str = "timestamp,unix_time,mode,cmd_rpm,reason,pred_ts1s_max,kf_ambient,kf_H,kf_C,kf_S,replica_bias,power_mode,fan_ceiling,\
+cpu_pl1_w,dgpu_cap_w,dgpu_active,heat_w,sustainable_w,rapl_pkg_w,rapl_core_w,igpu_act_mhz,igpu_req_mhz,cpu_busy_pct,cpu_iowait_pct,wifi_mb_s";
 
 /// Extra per-second measurements for the CSV (live only).
 #[derive(Default)]
 struct Extra {
     rapl: Option<(f64, f64)>,
     igpu: Option<(f64, f64)>,
+    cpu: Option<(f64, f64)>,
+    wifi: Option<f64>,
 }
 
 fn csv_row(mode: &str, ctl: &Controller, vals: &[Option<f64>], unix: f64, dgpu_active: bool, x: &Extra) -> String {
@@ -189,15 +194,18 @@ fn csv_row(mode: &str, ctl: &Controller, vals: &[Option<f64>], unix: f64, dgpu_a
     );
     let opt = |v: Option<f64>| v.map_or(String::new(), |v| format!("{v:.1}"));
     row.push_str(&format!(
-        ",{},{:.0},{},{},{}",
+        ",{},{:.0},{},{},{},{:.2},{:.2}",
         ctl.mode.name(),
         ctl.cfg.fan_ceiling(ctl.mode).min(ctl.hi),
         opt(ctl.caps.map(|c| rapl_limits(&ctl.cfg, c.cpu).0)),
         opt(ctl.caps.and_then(|c| c.gpu)),
-        u8::from(dgpu_active)
+        u8::from(dgpu_active),
+        ctl.heat(),
+        ctl.sustainable
     ));
     let pair = |v: Option<(f64, f64)>| v.map_or(",".to_owned(), |(a, b)| format!("{a:.2},{b:.2}"));
-    row.push_str(&format!(",{},{}", pair(x.rapl), pair(x.igpu)));
+    let wifi = x.wifi.map_or(String::new(), |w| format!("{w:.3}"));
+    row.push_str(&format!(",{},{},{},{wifi}", pair(x.rapl), pair(x.igpu), pair(x.cpu)));
     for v in vals {
         row.push(',');
         if let Some(v) = v {
@@ -278,6 +286,7 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
         let mut gpu_written: Option<f64> = None;
         let mut dpm_job: Option<std::process::Child> = None;
         let mut meter = hw::RaplMeter::new();
+        let (mut cpu_meter, mut wifi_meter) = (hw::CpuMeter::new(), hw::WifiMeter::new());
         let mut lavd = hw::Lavd::new();
         while !stop.load(Ordering::Relaxed) {
             next += Duration::from_secs(1);
@@ -299,7 +308,7 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
                         ctl.reset(&r);
                     }
                     let cmd = ctl.tick(&r);
-                    let extra = Extra { rapl: meter.read(), igpu: hw::igpu_mhz() };
+                    let extra = Extra { rapl: meter.read(), igpu: hw::igpu_mhz(), cpu: cpu_meter.read(), wifi: wifi_meter.read() };
                     if !shadow {
                         fans.set(cmd)?;
                         match ctl.caps {
@@ -347,13 +356,14 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
                             }
                         });
                         println!(
-                            "{} [{}] {}: {cmd:.0} rpm, {caps}, Ts1S {:.2}, pred max {:.2}, room {:+.2} K",
+                            "{} [{}] {}: {cmd:.0} rpm, {caps}, Ts1S {:.2}, pred max {:.2}, room {:+.2} K, extra heat {:+.1} W",
                             local_time(now.1 as i64, "%T"),
                             ctl.mode.name(),
                             ctl.reason,
                             r.ts1s,
                             ctl.pred,
-                            ctl.kf.ambient()
+                            ctl.kf.ambient(),
+                            ctl.heat()
                         );
                         last = (ctl.reason, ctl.mode);
                     }
@@ -478,6 +488,7 @@ fn run_replay(cfg: Config, cfg_dir: &Path, path: &Path, trace: bool, mode: Optio
 
 fn usage() -> ! {
     eprintln!("usage: t2opt-fand [--config FILE] [--shadow | --replay CSV [--trace] [--mode eco|balanced|perf] | --release]");
+    eprintln!("       t2opt-fand [--config FILE] --sim CSV [--plant MODEL] [--plant-heat K] [--inject] [--from TIME] [--to TIME] [--mode M] [--out CSV]");
     std::process::exit(2)
 }
 
@@ -485,6 +496,9 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut config = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/fand.toml"));
     let (mut shadow, mut trace, mut release, mut replay, mut mode) = (false, false, false, None, None);
+    let (mut plant_heat, mut inject) = (1.0, false);
+    let (mut sim, mut plant, mut out): (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) = (None, None, None);
+    let (mut from, mut to): (Option<String>, Option<String>) = (None, None);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--config" => config = args.next().unwrap_or_else(|| usage()).into(),
@@ -492,6 +506,13 @@ fn main() {
             "--trace" => trace = true,
             "--release" => release = true,
             "--replay" => replay = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            "--sim" => sim = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            "--plant" => plant = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
+            "--plant-heat" => plant_heat = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
+            "--inject" => inject = true,
+            "--from" => from = Some(args.next().unwrap_or_else(|| usage())),
+            "--to" => to = Some(args.next().unwrap_or_else(|| usage())),
+            "--out" => out = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--mode" => mode = Some(args.next().as_deref().and_then(Mode::parse).unwrap_or_else(|| usage())),
             _ => usage(),
         }
@@ -515,6 +536,9 @@ fn main() {
                 eprintln!("core limit: {e}");
             }
             hw::Fans::open().map(|f| f.release())
+        } else if let Some(csv) = sim {
+            let a = sim::SimArgs { plant: plant.as_deref(), plant_heat, inject, from: from.as_deref(), to: to.as_deref(), mode, out: out.as_deref() };
+            sim::run_sim(cfg, &cfg_dir, &csv, a)
         } else if let Some(csv) = replay {
             run_replay(cfg, &cfg_dir, &csv, trace, mode)
         } else {

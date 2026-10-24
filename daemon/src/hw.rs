@@ -320,3 +320,48 @@ impl Lavd {
         self.applied = Some(mode);
     }
 }
+
+/// CPU busy and iowait shares (%) from /proc/stat, between two reads.
+pub struct CpuMeter {
+    last: Option<(u64, u64, u64)>,
+}
+
+impl CpuMeter {
+    pub fn new() -> Self {
+        Self { last: None }
+    }
+
+    pub fn read(&mut self) -> Option<(f64, f64)> {
+        let stat = std::fs::read_to_string("/proc/stat").ok()?;
+        // cpu user nice system idle iowait irq softirq steal ...
+        let v: Vec<u64> = stat.lines().next()?.split_whitespace().skip(1).filter_map(|x| x.parse().ok()).collect();
+        let (total, idle, iowait) = (v.iter().take(8).sum::<u64>(), *v.get(3)?, *v.get(4)?);
+        let prev = self.last.replace((total, idle, iowait))?;
+        let dt = total.checked_sub(prev.0).filter(|&d| d > 0)? as f64;
+        let busy = dt - (idle - prev.1.min(idle)) as f64 - (iowait - prev.2.min(iowait)) as f64;
+        Some((100.0 * busy / dt, 100.0 * (iowait - prev.2.min(iowait)) as f64 / dt))
+    }
+}
+
+/// Wi-Fi traffic (MB/s, received + sent) on the first wireless interface:
+/// a long download heats the Wi-Fi module, which the model has no input for.
+pub struct WifiMeter {
+    dev: Option<std::path::PathBuf>,
+    last: Option<(u64, std::time::Instant)>,
+}
+
+impl WifiMeter {
+    pub fn new() -> Self {
+        let dev = std::fs::read_dir("/sys/class/net").ok().and_then(|d| d.flatten().map(|e| e.path()).find(|p| p.join("wireless").exists()));
+        Self { dev, last: None }
+    }
+
+    pub fn read(&mut self) -> Option<f64> {
+        let dev = self.dev.as_ref()?;
+        let n = |f: &str| std::fs::read_to_string(dev.join("statistics").join(f)).ok()?.trim().parse::<u64>().ok();
+        let now = (n("rx_bytes")? + n("tx_bytes")?, std::time::Instant::now());
+        let prev = self.last.replace(now)?;
+        let dt = now.1.duration_since(prev.1).as_secs_f64();
+        (dt > 0.2 && now.0 >= prev.0).then(|| (now.0 - prev.0) as f64 / dt / 1e6)
+    }
+}

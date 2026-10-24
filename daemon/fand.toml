@@ -10,6 +10,13 @@ model = "../models/rc3m-c.json"
 # the model's 90 s error is ~0.4 °C rms, so 44.6 leaves about one sigma.
 ceiling_c = 44.6
 
+# eco keeps the CPU package around this on average (RAPL W), bursting to the
+# PL1 maximum for ~eco_burst_s once it has been under it for a while
+# (user, 2026-10-24: 6-10 W sustained, still boosting when needed). The iGPU
+# shares this budget: 9 W once starved the cores during iGPU video decode
+eco_sustained_w = 8.0
+eco_burst_s = 30.0
+
 # fans never go below / above these (mean of the two fans, rpm);
 # the SMC's own range is ~2080-5708
 min_rpm = 0

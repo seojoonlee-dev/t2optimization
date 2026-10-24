@@ -1,10 +1,15 @@
 //! Planner and controller: which fan speed and power caps to command.
 //!
-//! The power mode sets only a fan ceiling. Under it, the controller picks the
-//! slowest fan speed that keeps predicted Ts1S under the ceiling, and caps
-//! CPU + dGPU power at the most they can draw while the mode's fan ceiling
-//! still holds Ts1S there. Light loads never reach the cap; heavy ones get
-//! the fans first, then a lower cap instead of louder fans.
+//! The power mode sets a fan ceiling (and eco an energy budget). Under it, the
+//! controller picks the slowest fan speed that keeps predicted Ts1S under the
+//! ceiling. CPU + dGPU power is capped at what the mode's fan ceiling can
+//! sustain (the model's steady state), with bursts above that only while
+//! there is room to drop back to it. Light loads never reach the cap; heavy
+//! ones get the fans first, then glide down to the sustainable power.
+//!
+//! Heat the model doesn't know about (Wi-Fi under a long Steam download ran
+//! TW0P 2+ K over the model, 2026-10-21) is learned by integral action on
+//! Ts1S while power-limited and added to every prediction.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -21,8 +26,23 @@ pub struct Config {
     /// where the 1 Hz CSV logs go, relative to the config file's directory
     pub log_dir: String,
     pub log_csv: bool,
-    /// Ts1S the plan must stay under; the SMC budget's set point is 44.989
+    /// Ts1S the plan must stay under; the SMC budget's set point is 44.989.
+    /// Fans plan for it, and the power caps settle Ts1S there
     pub ceiling_c: f64,
+    /// a burst is planned as held this long, then cut to the sustainable power
+    pub cap_hold_s: u32,
+    /// CPU + dGPU power (PC0R + PG0R) never allowed over this: the SMC's
+    /// budget (PZ0E) is 70 W even when cool, and its 30 s mean of the zone
+    /// power going over it throttles (CPU 45 W + dGPU 30 W would)
+    pub zone_max_w: f64,
+    /// how far ahead the burst plan looks (the chassis takes minutes)
+    pub sustain_horizon_s: u32,
+    /// integral action on Ts1S over the ceiling while power-limited, W of
+    /// extra heat per K·s; limited to ± heat_max_w, fades with heat_fade_s
+    /// once the load is gone
+    pub heat_gain: f64,
+    pub heat_max_w: f64,
+    pub heat_fade_s: f64,
     /// extra margin a slower fan speed needs before the fans come down
     pub down_hysteresis_c: f64,
     pub horizon_s: u32,
@@ -39,11 +59,19 @@ pub struct Config {
     /// die-temperature floors: min fans at the first value, max fans at the second
     pub cpu_floor_c: [f64; 2],
     pub gpu_floor_c: [f64; 2],
-    /// measured Ts1S this far above the set point -> full speed until back under the ceiling
+    /// measured Ts1S this far above the set point -> fans past the mode's
+    /// ceiling (full speed at cut_over_setpoint_c) until back under the ceiling
     pub panic_over_setpoint_c: f64,
+    /// measured Ts1S this far above the set point -> both caps to their floors
+    pub cut_over_setpoint_c: f64,
     /// mode at start when no mode file says otherwise: eco, balanced or perf
     pub default_mode: String,
     pub fan_ceiling_rpm: FanCeilings,
+    /// eco holds the CPU package (RAPL W) to this on average, and lets it
+    /// burst to cpu_pl1_max_w for about eco_burst_s once it has been under
+    /// it for a while (an energy budget; the cap slides down as it drains)
+    pub eco_sustained_w: f64,
+    pub eco_burst_s: f64,
     /// CPU package limit range (RAPL PL1, W); the low end keeps the iGPU,
     /// which shares the package budget, from starving (9 W stuttered video)
     pub cpu_pl1_min_w: f64,
@@ -149,6 +177,12 @@ impl Default for Config {
             log_dir: "../data".into(),
             log_csv: true,
             ceiling_c: 44.6,
+            cap_hold_s: 30,
+            zone_max_w: 64.0,
+            sustain_horizon_s: 600,
+            heat_gain: 0.1,
+            heat_max_w: 20.0,
+            heat_fade_s: 1800.0,
             down_hysteresis_c: 0.15,
             horizon_s: 90,
             plan_every_s: 5,
@@ -160,8 +194,11 @@ impl Default for Config {
             cpu_floor_c: [88.0, 98.0],
             gpu_floor_c: [85.0, 95.0],
             panic_over_setpoint_c: 0.4,
+            cut_over_setpoint_c: 1.5,
             default_mode: "balanced".into(),
             fan_ceiling_rpm: FanCeilings::default(),
+            eco_sustained_w: 8.0,
+            eco_burst_s: 30.0,
             cpu_pl1_min_w: 12.0,
             cpu_pl1_max_w: 45.0,
             pl2_extra_w: 5.0,
@@ -256,6 +293,8 @@ struct Planner {
     lo: f64,
     candidates: Vec<f64>,
     alpha: [f64; 5],
+    /// heat the model misses (W, CPU-rail equivalent), added to every prediction
+    heat: f64,
 }
 
 impl Planner {
@@ -269,51 +308,68 @@ impl Planner {
         }
         candidates.sort_by(f64::total_cmp);
         candidates.dedup();
-        Self { lo, candidates, alpha: model::ema_alpha() }
+        Self { lo, candidates, alpha: model::ema_alpha(), heat: 0.0 }
     }
 
-    /// Largest CPU + dGPU budget (each drawing its whole share) that keeps
-    /// predicted Ts1S under the ceiling with the fans at `fan`.
+    /// CPU + dGPU budget (each drawing its whole share), from two questions:
+    ///
+    /// - sustainable: the most that, held forever at the fan speed `fan`,
+    ///   settles Ts1S at `ceiling_c` (the model's steady state, with the
+    ///   filter's room estimate, so heat the model misses lowers it);
+    /// - now: the most that can be held for `cap_hold_s` and then cut to the
+    ///   sustainable level with Ts1S staying under `ceiling_c` over
+    ///   `sustain_horizon_s`.
+    ///
+    /// The second is never below the first unless the machine is already
+    /// too hot, so a long load glides down to the sustainable level instead
+    /// of being cut to the floor and let back up.
     #[allow(clippy::too_many_arguments)]
-    fn power_cap(&self, cfg: &Config, m: &mut Model, kf: &Kalman, rep: &Replica, demand: Power, dgpu_active: bool, fan: f64, rpm_now: f64) -> Caps {
+    fn power_cap(&self, cfg: &Config, m: &mut Model, kf: &Kalman, rep: &Replica, demand: Power, dgpu_active: bool, fan: f64, rpm_now: f64) -> (Caps, f64) {
         let (cmin, cmax) = cfg.cpu_range();
         let (lo, hi) = if dgpu_active { (cmin + cfg.dgpu_cap_min_w, cmax + cfg.dgpu_cap_max_w) } else { (cmin, cmax) };
-        let ok = |total: f64, m: &mut Model| {
+        // the SMC budget is 70 W at most: more than that throttles at any temperature
+        let hi = hi.min(cfg.zone_max_w).max(lo);
+        let power = |total: f64| {
             let c = split(cfg, total, demand, dgpu_active);
-            let p = Power { pc: c.cpu, pg: c.gpu.unwrap_or(demand.pg), pm: demand.pm };
-            self.predict(m, kf, rep, p, fan, cfg.horizon_s, rpm_now) <= cfg.ceiling_c
+            Power { pc: c.cpu, pg: c.gpu.unwrap_or(demand.pg), pm: demand.pm }
         };
-        if ok(hi, m) {
-            return split(cfg, hi, demand, dgpu_active);
-        }
-        if !ok(lo, m) {
-            return split(cfg, lo, demand, dgpu_active);
-        }
-        // invariant: lo passes, hi fails; 0.25 W is finer than RAPL needs
-        let (mut lo, mut hi) = (lo, hi);
-        while hi - lo > 0.25 {
-            let mid = (lo + hi) / 2.0;
-            if ok(mid, m) {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        split(cfg, lo, demand, dgpu_active)
+        let sus = bisect(lo, hi, |t| self.steady(m, kf, rep, power(t), fan) <= cfg.ceiling_c);
+        let ps = power(sus);
+        let mut ok = |t: f64| {
+            let pb = power(t);
+            self.predict_seq(m, kf, rep, |i| if i < cfg.cap_hold_s { pb } else { ps }, fan, cfg.sustain_horizon_s, rpm_now) <= cfg.ceiling_c
+        };
+        // already past the burst ceiling: hold the sustainable power, which
+        // brings Ts1S back to the ceiling; cutting deeper made a sawtooth
+        let now = if ok(sus) { bisect(sus, hi, ok) } else { sus };
+        (split(cfg, now, demand, dgpu_active), sus)
     }
 
-    /// Max predicted Ts1S over the horizon; the fans move from rpm_now
-    /// toward the target with FAN_TAU_S lag.
+    /// Ts1S once power `p` has been held at fan speed `rpm` for good.
+    fn steady(&self, m: &Model, kf: &Kalman, rep: &Replica, p: Power, rpm: f64) -> f64 {
+        let p = Power { pc: p.pc + self.heat, ..p };
+        model::ts1s(&m.sensors(&m.steady(p, rpm), kf.ambient())) + rep.bias
+    }
+
+    /// Max predicted Ts1S over the horizon with power held at `p`.
     #[allow(clippy::too_many_arguments)]
     fn predict(&self, m: &mut Model, kf: &Kalman, rep: &Replica, p: Power, rpm: f64, horizon: u32, rpm_now: f64) -> f64 {
+        self.predict_seq(m, kf, rep, |_| p, rpm, horizon, rpm_now)
+    }
+
+    /// Max predicted Ts1S over the horizon, power `p(second)`; the fans move
+    /// from rpm_now toward the target with FAN_TAU_S lag.
+    #[allow(clippy::too_many_arguments)]
+    fn predict_seq(&self, m: &mut Model, kf: &Kalman, rep: &Replica, p: impl Fn(u32) -> Power, rpm: f64, horizon: u32, rpm_now: f64) -> f64 {
         let mut x = kf.nodes();
         let mut ema = rep.ema;
-        let amb = kf.ambient();
+        let (amb, heat) = (kf.ambient(), self.heat);
         let mut ts_max = f64::NEG_INFINITY;
         for i in 0..horizon {
             // mid-step fan speed; after ~10 s it is the target
             let fan = if i < 10 { rpm + (rpm_now - rpm) * (-(i as f64 + 0.5) / FAN_TAU_S).exp() } else { rpm };
-            x = model::advance(&m.step(fan), &x, p);
+            let pi = p(i);
+            x = model::advance(&m.step(fan), &x, Power { pc: pi.pc + heat, ..pi });
             let y = m.sensors(&x, amb);
             for k in 0..5 {
                 ema[k] += self.alpha[k] * (y[k] - ema[k]);
@@ -365,6 +421,28 @@ impl Planner {
     }
 }
 
+/// Largest value in [lo, hi] that passes `ok` (to 0.25 W), assuming passing
+/// is monotone; lo if even lo fails.
+fn bisect(lo: f64, hi: f64, ok: impl FnMut(f64) -> bool) -> f64 {
+    let mut ok = ok;
+    if ok(hi) {
+        return hi;
+    }
+    if !ok(lo) {
+        return lo;
+    }
+    let (mut lo, mut hi) = (lo, hi);
+    while hi - lo > 0.25 {
+        let mid = (lo + hi) / 2.0;
+        if ok(mid) {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 /// rpm_lo below lo, rpm_hi above hi, linear between.
 fn ramp(v: Option<f64>, [lo, hi]: [f64; 2], rpm_lo: f64, rpm_hi: f64) -> f64 {
     match v {
@@ -394,10 +472,17 @@ pub struct Controller {
     replan: bool,
     /// caps to apply; None until the first plan (the hardware keeps what it has)
     pub caps: Option<Caps>,
+    /// the thermal plan's caps, before eco's energy budget and safety cuts
+    plan_caps: Option<Caps>,
+    /// eco's energy budget, J of package energy above eco_sustained_w
+    energy_j: f64,
+    /// sustainable CPU + dGPU power at the mode's fan ceiling (PC0R + PG0R W), last plan
+    pub sustainable: f64,
 }
 
 impl Controller {
     pub fn new(cfg: Config, model: Model, rpm_lo: f64, rpm_hi: f64) -> Self {
+        let energy_j = (cfg.cpu_pl1_max_w - cfg.eco_sustained_w) * cfg.eco_burst_s;
         let lo = rpm_lo.max(cfg.min_rpm as f64);
         let hi = rpm_hi.min(cfg.max_rpm as f64);
         Self {
@@ -420,10 +505,28 @@ impl Controller {
             mode: Mode::Balanced,
             replan: false,
             caps: None,
+            plan_caps: None,
+            energy_j,
+            sustainable: f64::NAN,
         }
     }
 
     /// Switch power mode; the next tick plans for it at once.
+    /// eco's CPU cap from its energy budget (PC0R W): the full PL1 range with
+    /// a full budget, sliding to eco_sustained_w as it drains; None outside eco.
+    fn energy_cap(&self) -> Option<f64> {
+        let cfg = &self.cfg;
+        (self.mode == Mode::Eco).then(|| {
+            let room = cfg.cpu_pl1_max_w - cfg.eco_sustained_w;
+            pc0r_from_pkg(cfg.eco_sustained_w + room * self.energy_j / (room * cfg.eco_burst_s))
+        })
+    }
+
+    /// Extra heat the integral action has found (W).
+    pub fn heat(&self) -> f64 {
+        self.planner.heat
+    }
+
     pub fn set_mode(&mut self, mode: Mode) {
         if mode != self.mode {
             self.mode = mode;
@@ -433,7 +536,7 @@ impl Controller {
 
     /// Caps drop at once and rise by at most cap_raise_w per plan.
     fn limit_rise(&self, want: Caps) -> Caps {
-        let Some(prev) = self.caps else { return want };
+        let Some(prev) = self.plan_caps else { return want };
         let rise = |p: f64, w: f64| if w > p { w.min(p + self.cfg.cap_raise_w) } else { w };
         Caps {
             cpu: rise(prev.cpu, want.cpu),
@@ -447,6 +550,7 @@ impl Controller {
     /// Start over: new model state, SMC filters re-read, warm-up again.
     pub fn reset(&mut self, r: &Reading) {
         self.kf.reset(&self.model, r.p, r.rpm);
+        self.planner.heat = 0.0;
         self.rep.reset(&r.y);
         self.zone_hist.clear();
         self.t = 0;
@@ -455,6 +559,24 @@ impl Controller {
         self.plan_reason = "warmup";
         self.pred = f64::NAN;
         self.started = true;
+    }
+
+    /// Integral action: with power capped (or Ts1S over the ceiling) and the
+    /// fans where the cap plan put them, Ts1S should sit at the ceiling. What
+    /// it is off by is heat the model doesn't know about (Wi-Fi under a long
+    /// download, model error at this load), so it becomes extra heat in every
+    /// prediction. Time over the ceiling always counts; time under it only
+    /// with the fans no faster than the plan (not while they come down from
+    /// a safety floor), and it fades once the load is gone.
+    fn integrate_heat(&mut self, r: &Reading, fan_max: f64) {
+        let cfg = &self.cfg;
+        let limited = self.plan_reason == "power-cap" || r.ts1s > cfg.ceiling_c;
+        let h = &mut self.planner.heat;
+        if limited && (r.ts1s > cfg.ceiling_c || self.cmd <= fan_max + cfg.rpm_step as f64) {
+            *h = (*h + cfg.heat_gain * (r.ts1s - cfg.ceiling_c)).clamp(-cfg.heat_max_w, cfg.heat_max_w);
+        } else if !limited {
+            *h *= (-1.0 / cfg.heat_fade_s).exp();
+        }
     }
 
     /// One second. Returns the commanded mean fan speed.
@@ -472,6 +594,11 @@ impl Controller {
         }
 
         let fan_max = cfg.fan_ceiling(self.mode).min(self.hi);
+        // eco's energy budget: refills below the sustained power, drains above it
+        let (sus, room) = (cfg.eco_sustained_w, cfg.cpu_pl1_max_w - cfg.eco_sustained_w);
+        self.energy_j = (self.energy_j + sus - pkg_from_pc0r(r.p.pc)).clamp(0.0, room * cfg.eco_burst_s);
+        self.integrate_heat(r, fan_max);
+        let cfg = &self.cfg;
         if self.t >= cfg.warmup_s && (self.replan || self.t.is_multiple_of(cfg.plan_every_s)) {
             self.replan = false;
             // power over the horizon: the higher of the last 10 s and 60 s means,
@@ -485,22 +612,35 @@ impl Controller {
             let (m10, m60) = (mean(10), mean(60));
             // memory power follows the window CPU + dGPU power picked
             let demand = if m10.pc + m10.pg > m60.pc + m60.pg { m10 } else { m60 };
-            let want = self.planner.power_cap(cfg, &mut self.model, &self.kf, &self.rep, demand, r.dgpu_active, fan_max, r.rpm);
+            let (want, sus) = self.planner.power_cap(cfg, &mut self.model, &self.kf, &self.rep, demand, r.dgpu_active, fan_max, r.rpm);
+            self.sustainable = sus;
             let caps = self.limit_rise(want);
-            // the fans plan for the power the caps let through
-            let p = Power { pc: demand.pc.min(caps.cpu), pg: caps.gpu.map_or(demand.pg, |g| demand.pg.min(g)), pm: demand.pm };
+            // the fans plan for the power the caps (and eco's energy budget) let through
+            let p = Power { pc: demand.pc.min(caps.cpu).min(self.energy_cap().unwrap_or(f64::INFINITY)), pg: caps.gpu.map_or(demand.pg, |g| demand.pg.min(g)), pm: demand.pm };
             (self.plan_rpm, self.pred, self.plan_reason) =
                 self.planner.plan(cfg, &mut self.model, &self.kf, &self.rep, p, self.cmd, r.rpm, fan_max);
             // a load pressing against a cap that is below its maximum
             let cpu_capped = caps.cpu < pc0r_from_pkg(cfg.cpu_pl1_max_w) - 0.01 && demand.pc >= caps.cpu - 1.0;
             let gpu_capped = caps.gpu.is_some_and(|g| g < cfg.dgpu_cap_max_w - 0.01 && demand.pg >= g - 1.0);
             if cpu_capped || gpu_capped {
+                // fans before power: a cap that binds means the fans are at the mode's ceiling
+                self.plan_rpm = self.plan_rpm.max(fan_max);
                 self.plan_reason = "power-cap";
             }
-            self.caps = Some(caps);
+            self.plan_caps = Some(caps);
         }
         self.t += 1;
+        let energy = self.energy_cap();
+        self.caps = self.plan_caps.map(|c| match energy {
+            Some(e) if e < c.cpu => Caps { cpu: e, ..c },
+            _ => c,
+        });
+        if energy.is_some_and(|e| self.caps.is_some_and(|c| c.cpu == e) && r.p.pc >= e - 1.0) {
+            self.plan_reason = "energy-cap";
+        }
+        let cfg = &self.cfg;
 
+        let fan_max = cfg.fan_ceiling(self.mode).min(self.hi);
         let (mut target, mut reason) = (self.plan_rpm, self.plan_reason);
         let mut floors = vec![
             (ramp(r.tcmx, cfg.cpu_floor_c, self.lo, self.hi), "cpu-temp"),
@@ -511,14 +651,19 @@ impl Controller {
         } else if r.ts1s < cfg.ceiling_c {
             self.panic = false;
         }
-        // safety: past the mode's ceiling, and both caps to their floors
+        // safety: fans past the mode's ceiling; both caps to their floors only
+        // if the SMC throttles or Ts1S is far over (a few tenths over leave
+        // the SMC budget near 65 W, and cutting there made a sawtooth)
         if self.panic {
-            floors.push((self.hi, "ts1s-over"));
+            // graded: from the mode's ceiling to full speed over the band
+            // where cutting power would start
+            let band = [SETPOINT + cfg.panic_over_setpoint_c, SETPOINT + cfg.cut_over_setpoint_c];
+            floors.push((ramp(Some(r.ts1s), band, fan_max, self.hi).max(fan_max), "ts1s-over"));
         }
         if r.pz0t > 0.0 {
             floors.push((self.hi, "smc-throttle"));
         }
-        if self.panic || r.pz0t > 0.0 {
+        if r.pz0t > 0.0 || r.ts1s > SETPOINT + cfg.cut_over_setpoint_c {
             let (cmin, _) = cfg.cpu_range();
             self.caps = Some(Caps { cpu: cmin, gpu: r.dgpu_active.then_some(cfg.dgpu_cap_min_w) });
         }
