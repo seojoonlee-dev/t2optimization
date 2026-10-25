@@ -17,6 +17,19 @@ ceiling_c = 44.6
 eco_sustained_w = 8.0
 eco_burst_s = 30.0
 
+# eco's hard dGPU cap (power1_cap W, no burst; user, 2026-10-25). Without it
+# eco let Minecraft hold the dGPU at ~20-25 W (2026-10-24). The rail (PG0R)
+# read ~1.5-2.5 W above the cap in a short 2026-10-25 log
+eco_dgpu_cap_w = 10.0
+
+# while that budget holds the package, the cores are fenced (RAPL PP0) at the
+# package minus eco_uncore_w and the package limit rises by eco_igpu_w for the
+# iGPU only: capped at 8 W the cores took everything and the iGPU sat at
+# 100-250 MHz (desktop lag, 2026-10-24). 6 W ~ the iGPU's p90 at 500-1300 MHz
+# in the 2026-10-19 logs; 4 W ~ the non-core package power at the cap
+eco_igpu_w = 6.0
+eco_uncore_w = 4.0
+
 # fans never go below / above these (mean of the two fans, rpm);
 # the SMC's own range is ~2080-5708
 min_rpm = 0

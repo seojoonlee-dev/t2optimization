@@ -148,7 +148,9 @@ pub fn run_sim(cfg: Config, cfg_dir: &Path, path: &Path, a: SimArgs) -> Result<(
         // what the logged load asked for: everything, where a cap held it
         let capped = |drawn: Option<f64>, cap: Option<f64>, max: f64| matches!((drawn, cap), (Some(d), Some(c)) if c < max - 0.5 && d >= c - 1.5);
         let pkg_logged = num(row, "rapl_pkg_w").unwrap_or(pkg_from_pc0r(r.p.pc));
-        let pc_want = if capped(Some(pkg_logged), num(row, "cpu_pl1_w"), pl1_max) { pc0r_from_pkg(pl1_max) } else { r.p.pc };
+        // eco's iGPU fence: the cores at their own limit held the package too
+        let cores_capped = matches!((num(row, "rapl_core_w"), num(row, "cpu_cores_w")), (Some(d), Some(c)) if d >= c - 1.0);
+        let pc_want = if cores_capped || capped(Some(pkg_logged), num(row, "cpu_pl1_w"), pl1_max) { pc0r_from_pkg(pl1_max) } else { r.p.pc };
         let pg_want = if capped(Some(r.p.pg), num(row, "dgpu_cap_w"), gpu_max) { gpu_max } else { r.p.pg };
         let want = Power { pc: pc_want, pg: pg_want, pm: r.p.pm };
 
@@ -178,7 +180,10 @@ pub fn run_sim(cfg: Config, cfg_dir: &Path, path: &Path, a: SimArgs) -> Result<(
         let cmd = ctl.tick(&sr);
         let pl1 = ctl.caps.map_or(ctl.cfg.warmup_pl1_w, |c| rapl_limits(&ctl.cfg, c.cpu).0);
         let gcap = ctl.caps.and_then(|c| c.gpu);
-        let p = Power { pc: want.pc.min(pc0r_from_pkg(pl1)), pg: gcap.map_or(want.pg, |g| want.pg.min(g)), pm: want.pm };
+        // under the fence the cores get their limit and the rest of the
+        // package what it drew in the log (the iGPU as logged, else idle)
+        let fence = ctl.caps.and_then(|c| c.cores).map_or(f64::INFINITY, |w| w + ctl.cfg.eco_uncore_w + num(row, "rapl_gfx_w").unwrap_or(0.0));
+        let p = Power { pc: want.pc.min(pc0r_from_pkg(pl1.min(fence))), pg: gcap.map_or(want.pg, |g| want.pg.min(g)), pm: want.pm };
         let k = a.plant_heat;
         *x = model::advance(&plant.step(*rpm), x, Power { pc: k * p.pc, pg: k * p.pg, pm: k * p.pm });
         *rpm += (cmd - *rpm) * (1.0 - (-1.0 / FAN_TAU_S).exp());

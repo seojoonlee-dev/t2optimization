@@ -167,12 +167,12 @@ fn write_status(mode: &str, ctl: &Controller, r: &Reading) {
 }
 
 const CSV_HEAD: &str = "timestamp,unix_time,mode,cmd_rpm,reason,pred_ts1s_max,kf_ambient,kf_H,kf_C,kf_S,replica_bias,power_mode,fan_ceiling,\
-cpu_pl1_w,dgpu_cap_w,dgpu_active,heat_w,sustainable_w,rapl_pkg_w,rapl_core_w,igpu_act_mhz,igpu_req_mhz,cpu_busy_pct,cpu_iowait_pct,wifi_mb_s";
+cpu_pl1_w,cpu_cores_w,dgpu_cap_w,dgpu_active,heat_w,sustainable_w,rapl_pkg_w,rapl_core_w,rapl_gfx_w,igpu_act_mhz,igpu_req_mhz,cpu_busy_pct,cpu_iowait_pct,wifi_mb_s";
 
 /// Extra per-second measurements for the CSV (live only).
 #[derive(Default)]
 struct Extra {
-    rapl: Option<(f64, f64)>,
+    rapl: Option<[f64; 3]>,
     igpu: Option<(f64, f64)>,
     cpu: Option<(f64, f64)>,
     wifi: Option<f64>,
@@ -194,10 +194,11 @@ fn csv_row(mode: &str, ctl: &Controller, vals: &[Option<f64>], unix: f64, dgpu_a
     );
     let opt = |v: Option<f64>| v.map_or(String::new(), |v| format!("{v:.1}"));
     row.push_str(&format!(
-        ",{},{:.0},{},{},{},{:.2},{:.2}",
+        ",{},{:.0},{},{},{},{},{:.2},{:.2}",
         ctl.mode.name(),
         ctl.cfg.fan_ceiling(ctl.mode).min(ctl.hi),
         opt(ctl.caps.map(|c| rapl_limits(&ctl.cfg, c.cpu).0)),
+        opt(ctl.caps.and_then(|c| c.cores)),
         opt(ctl.caps.and_then(|c| c.gpu)),
         u8::from(dgpu_active),
         ctl.heat(),
@@ -205,7 +206,8 @@ fn csv_row(mode: &str, ctl: &Controller, vals: &[Option<f64>], unix: f64, dgpu_a
     ));
     let pair = |v: Option<(f64, f64)>| v.map_or(",".to_owned(), |(a, b)| format!("{a:.2},{b:.2}"));
     let wifi = x.wifi.map_or(String::new(), |w| format!("{w:.3}"));
-    row.push_str(&format!(",{},{},{},{wifi}", pair(x.rapl), pair(x.igpu), pair(x.cpu)));
+    let rapl = x.rapl.map_or(",,".to_owned(), |[p, c, g]| format!("{p:.2},{c:.2},{g:.2}"));
+    row.push_str(&format!(",{rapl},{},{},{wifi}", pair(x.igpu), pair(x.cpu)));
     for v in vals {
         row.push(',');
         if let Some(v) = v {
@@ -243,7 +245,8 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
     // PM0C is only optional when the model doesn't take it
     let optional: Vec<&str> = OPTIONAL.iter().copied().filter(|k| !(uses_pm && *k == "PM0C")).collect();
     let smc = hw::SmcReader::open(&KEYS, &optional)?;
-    let dgpu = hw::Dgpu::find();
+    // amdgpu can register its card after fand starts at boot, so a miss is retried each tick
+    let mut dgpu = hw::Dgpu::find();
     // an earlier build could leave the cores-only power limit on
     if !shadow {
         hw::set_core_limit(None, 0.0)?;
@@ -302,6 +305,12 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
             match reading(&vals, uses_pm) {
                 Err(missing) => println!("incomplete SMC read, skipped: {missing:?}"),
                 Ok(mut r) => {
+                    if dgpu.is_none() {
+                        dgpu = hw::Dgpu::find();
+                        if dgpu.is_some() {
+                            println!("dGPU found");
+                        }
+                    }
                     r.dgpu_active = dgpu.as_ref().is_some_and(|d| d.active());
                     if resumed {
                         println!("resume detected: model state reset");
@@ -315,8 +324,12 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
                             Some(c) => {
                                 let (pl1, pl2) = rapl_limits(&cfg, c.cpu);
                                 hw::set_cpu_limits(pl1, pl2, cfg.pl1_window_s)?;
+                                hw::set_core_limit(c.cores, cfg.pl1_window_s)?;
                             }
-                            None => hw::set_cpu_limits(cfg.warmup_pl1_w, cfg.warmup_pl1_w + cfg.pl2_extra_w, cfg.pl1_window_s).map(drop)?,
+                            None => {
+                                hw::set_cpu_limits(cfg.warmup_pl1_w, cfg.warmup_pl1_w + cfg.pl2_extra_w, cfg.pl1_window_s)?;
+                                hw::set_core_limit(None, 0.0)?;
+                            }
                         }
                         if cfg.lavd_profiles {
                             lavd.follow(ctl.mode);
@@ -350,9 +363,10 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
                     if ctl.reason != last.0 || ctl.mode != last.1 {
                         let caps = ctl.caps.map_or("caps not set yet".to_owned(), |c| {
                             let (pl1, _) = rapl_limits(&cfg, c.cpu);
+                            let cores = c.cores.map_or(String::new(), |w| format!(" (cores {w:.1} W)"));
                             match c.gpu {
-                                Some(g) => format!("PL1 {pl1:.1} W, dGPU {g:.1} W"),
-                                None => format!("PL1 {pl1:.1} W"),
+                                Some(g) => format!("PL1 {pl1:.1} W{cores}, dGPU {g:.1} W"),
+                                None => format!("PL1 {pl1:.1} W{cores}"),
                             }
                         });
                         println!(

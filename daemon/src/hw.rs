@@ -203,10 +203,11 @@ pub fn set_cpu_limits(pl1_w: f64, pl2_w: f64, window_s: f64) -> Result<bool, Str
 }
 
 const RAPL_CORE: &str = "/sys/class/powercap/intel-rapl:0:0";
+/// the "uncore" domain (PP1) is the iGPU
+const RAPL_GFX: &str = "/sys/class/powercap/intel-rapl:0:1";
 
-/// Cores-only limit (RAPL PP0). Not used for control at the moment (an iGPU
-/// reserve was tried and removed); kept so start and exit can make
-/// sure it is off. None switches it off.
+/// Cores-only limit (RAPL PP0): eco's iGPU fence while its energy budget
+/// holds the package. None switches it off (also at start and exit).
 pub fn set_core_limit(w: Option<f64>, window_s: f64) -> Result<(), String> {
     let enabled = rd(&format!("{RAPL_CORE}/enabled")).is_ok_and(|v| v == "1");
     let Some(w) = w else {
@@ -227,9 +228,9 @@ pub fn set_core_limit(w: Option<f64>, window_s: f64) -> Result<(), String> {
     Ok(())
 }
 
-/// Package and core power from the RAPL energy counters (root only), W.
+/// Package, core and iGPU power from the RAPL energy counters (root only), W.
 pub struct RaplMeter {
-    last: Option<(u64, u64, std::time::Instant)>,
+    last: Option<([u64; 3], std::time::Instant)>,
 }
 
 impl RaplMeter {
@@ -237,17 +238,16 @@ impl RaplMeter {
         Self { last: None }
     }
 
-    pub fn read(&mut self) -> Option<(f64, f64)> {
+    pub fn read(&mut self) -> Option<[f64; 3]> {
+        const DOMAINS: [&str; 3] = [RAPL, RAPL_CORE, RAPL_GFX];
         let e = |d: &str| rd(&format!("{d}/energy_uj")).ok()?.parse::<u64>().ok();
         let range = |d: &str| rd(&format!("{d}/max_energy_range_uj")).ok()?.parse::<u64>().ok();
-        let now = (e(RAPL)?, e(RAPL_CORE)?, std::time::Instant::now());
+        let now = ([e(RAPL)?, e(RAPL_CORE)?, e(RAPL_GFX)?], std::time::Instant::now());
         let prev = self.last.replace(now)?;
-        let dt = now.2.duration_since(prev.2).as_secs_f64();
+        let dt = now.1.duration_since(prev.1).as_secs_f64();
         // the counters wrap at max_energy_range_uj
         let delta = |a: u64, b: u64, r: Option<u64>| if b >= a { b - a } else { b + r.unwrap_or(u64::MAX) - a };
-        (dt > 0.2 && dt < 5.0).then(|| {
-            (delta(prev.0, now.0, range(RAPL)) as f64 / dt / 1e6, delta(prev.1, now.1, range(RAPL_CORE)) as f64 / dt / 1e6)
-        })
+        (dt > 0.2 && dt < 5.0).then(|| std::array::from_fn(|k| delta(prev.0[k], now.0[k], range(DOMAINS[k])) as f64 / dt / 1e6))
     }
 }
 
