@@ -12,3 +12,5 @@ daemon/target/
 # this machine's settings (see the .example files)
 local.env
 daemon/fand.local.toml
+# system-logging scripts stay local, never published (user, 2026-10-27)
+tools/
