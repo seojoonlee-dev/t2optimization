@@ -56,7 +56,8 @@ cpu_floor_avg_s = 1
 gpu_floor_c = [90.0, 100.0]
 
 # fan ceilings per mode (mean rpm): plans stay under these; safety floors may
-# go past. balanced 3300 -> 3500 (user, 2026-10-27): ~+0.9 W sustained in sim
+# go past. balanced 3300 -> 3500 (user, 2026-10-27): ~+0.9 W sustained in sim;
+# 3500 -> 4000 -> 3800 (user, 2026-10-27)
 [fan_ceiling_rpm]
 eco = 2500
-balanced = 3500
+balanced = 3800

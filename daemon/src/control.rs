@@ -129,7 +129,7 @@ pub struct FanCeilings {
 
 impl Default for FanCeilings {
     fn default() -> Self {
-        Self { eco: 2500, balanced: 3500, perf: 99999 }
+        Self { eco: 2500, balanced: 3800, perf: 99999 }
     }
 }
 
