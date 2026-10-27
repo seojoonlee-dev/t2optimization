@@ -1,6 +1,7 @@
 //! applesmc sysfs: SMC keys and fan control. Root only.
 
 use std::fs::{File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 
 /// applesmc binds to the T2's ACPI SMC device
@@ -25,13 +26,46 @@ fn decode(typ: &str, b: &[u8]) -> Option<f64> {
     })
 }
 
+/// Every SMC reader holds this (flock) while it uses key_at_index, so a
+/// second reader (a local logger) waits instead of interleaving.
+pub const SMC_LOCK: &str = "/run/t2opt-smc.lock";
+/// how long a read waits for another reader; past it, reading anyway beats
+/// stalling the fans behind a reader that hangs
+const SMC_LOCK_WAIT_MS: u32 = 200;
+
+/// Holds the SMC lock until dropped (or nothing, if it couldn't be had).
+struct SmcGuard<'a>(Option<&'a File>);
+
+impl Drop for SmcGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0 {
+            // SAFETY: flock on an open fd
+            unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
+}
+
+fn smc_lock(lock: &File) -> SmcGuard<'_> {
+    for _ in 0..SMC_LOCK_WAIT_MS / 5 {
+        // SAFETY: flock on an open fd
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return SmcGuard(Some(lock));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    println!("SMC lock held by another reader for {SMC_LOCK_WAIT_MS} ms; reading without it");
+    SmcGuard(None)
+}
+
 /// Reads a fixed set of SMC keys through key_at_index.
 ///
 /// key_at_index is one shared register: a second process reading keys at the
-/// same time interleaves with this one and corrupts both.
+/// same time interleaves with this one and corrupts both, so readers take
+/// SMC_LOCK around their reads.
 pub struct SmcReader {
     idx: File,
     data: File,
+    lock: File,
     keys: Vec<Option<(u32, String)>>,
 }
 
@@ -40,7 +74,10 @@ impl SmcReader {
     pub fn open(names: &[&str], optional: &[&str]) -> Result<Self, String> {
         let idx = OpenOptions::new().write(true).open(format!("{SMC}/key_at_index")).map_err(|e| format!("key_at_index: {e}"))?;
         let data = File::open(format!("{SMC}/key_at_index_data")).map_err(|e| format!("key_at_index_data: {e}"))?;
+        let lock = OpenOptions::new().create(true).truncate(false).write(true).open(SMC_LOCK).map_err(|e| format!("{SMC_LOCK}: {e}"))?;
         let mut keys = vec![None; names.len()];
+        // the whole index scan in one go: another reader just waits
+        let guard = smc_lock(&lock);
         let count: u32 = rd(&format!("{SMC}/key_count"))?.parse().map_err(|e| format!("key_count: {e}"))?;
         for i in 0..count {
             idx.write_at(i.to_string().as_bytes(), 0).map_err(|e| format!("key_at_index: {e}"))?;
@@ -50,16 +87,18 @@ impl SmcReader {
                 keys[k] = Some((i, rd(&format!("{SMC}/key_at_index_type"))?));
             }
         }
+        drop(guard);
         let missing: Vec<_> = names.iter().zip(&keys).filter(|(n, k)| k.is_none() && !optional.contains(n)).map(|(n, _)| *n).collect();
         if !missing.is_empty() {
             return Err(format!("SMC keys not found: {missing:?}"));
         }
-        Ok(Self { idx, data, keys })
+        Ok(Self { idx, data, lock, keys })
     }
 
     /// One value per requested key, None where the read failed or the key is missing.
     pub fn read(&self) -> Vec<Option<f64>> {
         let mut buf = [0u8; 8];
+        let _guard = smc_lock(&self.lock);
         self.keys
             .iter()
             .map(|k| {
