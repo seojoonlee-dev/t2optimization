@@ -58,6 +58,9 @@ pub struct Config {
     pub max_rpm: u32,
     /// die-temperature floors: min fans at the first value, max fans at the second
     pub cpu_floor_c: [f64; 2],
+    /// the CPU floor follows the mean of the cores over this many seconds, so
+    /// a one-second spike on a core or two doesn't set it
+    pub cpu_floor_avg_s: u32,
     pub gpu_floor_c: [f64; 2],
     /// measured Ts1S this far above the set point -> fans past the mode's
     /// ceiling (full speed at cut_over_setpoint_c) until back under the ceiling
@@ -206,8 +209,9 @@ impl Default for Config {
             down_rpm_per_s: 30.0,
             min_rpm: 0,
             max_rpm: 99999,
-            cpu_floor_c: [88.0, 98.0],
-            gpu_floor_c: [85.0, 95.0],
+            cpu_floor_c: [90.0, 100.0],
+            cpu_floor_avg_s: 1,
+            gpu_floor_c: [90.0, 100.0],
             panic_over_setpoint_c: 0.4,
             cut_over_setpoint_c: 1.5,
             default_mode: "balanced".into(),
@@ -280,6 +284,9 @@ pub struct Reading {
     pub p: Power,
     pub rpm: f64,
     pub tcmx: Option<f64>,
+    /// mean of the CPU cores (coretemp), the CPU floor's input; TCMX where it
+    /// is missing (logs from before it was logged)
+    pub cores_c: Option<f64>,
     pub tgdd: Option<f64>,
     /// dGPU awake (runtime PM active); its power cap only applies then
     pub dgpu_active: bool,
@@ -484,6 +491,8 @@ pub struct Controller {
     pub reason: &'static str,
     panic: bool,
     zone_hist: VecDeque<Power>,
+    /// the CPU floor's input over the last cpu_floor_avg_s
+    cpu_hist: VecDeque<f64>,
     started: bool,
     t: u32,
     pub mode: Mode,
@@ -518,6 +527,7 @@ impl Controller {
             reason: "start",
             panic: false,
             zone_hist: VecDeque::with_capacity(61),
+            cpu_hist: VecDeque::new(),
             started: false,
             t: 0,
             mode: Mode::Balanced,
@@ -585,6 +595,7 @@ impl Controller {
         self.planner.heat = 0.0;
         self.rep.reset(&r.y);
         self.zone_hist.clear();
+        self.cpu_hist.clear();
         self.t = 0;
         self.cmd = r.rpm.clamp(self.lo, self.hi);
         self.plan_rpm = self.cmd;
@@ -623,6 +634,12 @@ impl Controller {
         self.zone_hist.push_back(r.p);
         if self.zone_hist.len() > 60 {
             self.zone_hist.pop_front();
+        }
+        if let Some(t) = r.cores_c.or(r.tcmx) {
+            self.cpu_hist.push_back(t);
+            while self.cpu_hist.len() > cfg.cpu_floor_avg_s.max(1) as usize {
+                self.cpu_hist.pop_front();
+            }
         }
 
         let fan_max = cfg.fan_ceiling(self.mode).min(self.hi);
@@ -685,8 +702,9 @@ impl Controller {
 
         let fan_max = cfg.fan_ceiling(self.mode).min(self.hi);
         let (mut target, mut reason) = (self.plan_rpm, self.plan_reason);
+        let cpu_c = (!self.cpu_hist.is_empty()).then(|| self.cpu_hist.iter().sum::<f64>() / self.cpu_hist.len() as f64);
         let mut floors = vec![
-            (ramp(r.tcmx, cfg.cpu_floor_c, self.lo, self.hi), "cpu-temp"),
+            (ramp(cpu_c, cfg.cpu_floor_c, self.lo, self.hi), "cpu-temp"),
             (ramp(r.tgdd, cfg.gpu_floor_c, self.lo, self.hi), "gpu-temp"),
         ];
         if r.ts1s > SETPOINT + cfg.panic_over_setpoint_c {

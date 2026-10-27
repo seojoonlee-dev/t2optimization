@@ -9,7 +9,10 @@
 //! by a cap (power within 1.5 W of it), the load is taken to want everything
 //! (PL1 max, dGPU cap max): a capped log can't say how much more it wanted.
 //!
-//! Die temperatures aren't modelled, so the CPU/GPU die floors never fire.
+//! Die temperatures aren't modelled: the floors see the logged CPU die
+//! temperature (TCMX, or the core mean where logged), moved by what the sim
+//! changed: the model's heatsink (H) difference under --inject, plus DIE_K_PER_W
+//! per W of CPU power. The dGPU die (TGDD) is replayed as logged.
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
@@ -18,6 +21,11 @@ use std::path::Path;
 use crate::control::{pc0r_from_pkg, pkg_from_pc0r, Config, Controller, Mode, Reading};
 use crate::model::{self, Kalman, Model, Power, FAN_TAU_S, SETPOINT};
 use crate::{rapl_limits, reading, KEYS};
+
+/// Die above heatsink per W of CPU power over 2-5 s: 0.25-0.45 K/W in the
+/// 10-19 stress test and two 10-20 fand logs; the top end, so capped runs
+/// read on the warm side.
+const DIE_K_PER_W: f64 = 0.4;
 
 /// The SMC's skin limiter (sim/smc.py, reverse-engineered 2026-10-19).
 struct Limiter {
@@ -176,7 +184,9 @@ pub fn run_sim(cfg: Config, cfg_dir: &Path, path: &Path, a: SimArgs) -> Result<(
         }
         let ts1s = model::ts1s(ema);
         let (pz0e, pz0t) = lim.step(ts1s, last_p.pc + last_p.pg);
-        let sr = Reading { y, ts1s, pz0t, p: *last_p, rpm: *rpm, tcmx: None, tgdd: None, dgpu_active: want.pg > 1.0 };
+        let dh = if a.inject { x[0] - shadow[0] } else { 0.0 };
+        let die = |t: Option<f64>| t.map(|t| t + dh + DIE_K_PER_W * (last_p.pc - r.p.pc));
+        let sr = Reading { y, ts1s, pz0t, p: *last_p, rpm: *rpm, tcmx: die(r.tcmx), cores_c: die(num(row, "cpu_core_c")), tgdd: r.tgdd, dgpu_active: want.pg > 1.0 };
         let cmd = ctl.tick(&sr);
         let pl1 = ctl.caps.map_or(ctl.cfg.warmup_pl1_w, |c| rapl_limits(&ctl.cfg, c.cpu).0);
         let gcap = ctl.caps.and_then(|c| c.gpu);

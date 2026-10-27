@@ -38,5 +38,11 @@ max_rpm = 99999
 # die-temperature floors: fans start rising at the first value and reach full
 # speed at the second, past any mode's fan ceiling; power caps are never cut
 # for die temperature (user, 2026-10-20)
-cpu_floor_c = [88.0, 98.0]
-gpu_floor_c = [85.0, 95.0]
+cpu_floor_c = [90.0, 100.0]
+# the CPU floor follows the mean of all cores (coretemp), averaged over this
+# many seconds, not the hottest core: one-second spikes from short bursts on a
+# core or two set fans to ~5300 rpm on TCMX (2026-10-27). 1 = no smoothing,
+# like the GPU floor: the core mean rarely spikes, and a 5 s mean only delayed
+# the first crossing by 2 s. Logs without the core mean fall back to TCMX.
+cpu_floor_avg_s = 1
+gpu_floor_c = [90.0, 100.0]

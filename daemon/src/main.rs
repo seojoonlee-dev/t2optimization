@@ -78,6 +78,7 @@ fn reading(vals: &[Option<f64>], uses_pm: bool) -> Result<Reading, Vec<&'static 
         p: Power { pc: k("PC0R"), pg: k("PG0R"), pm: if uses_pm { k("PM0C") } else { 0.0 } },
         rpm: (k("F0Ac") + k("F1Ac")) / 2.0,
         tcmx: key(vals, "TCMX"),
+        cores_c: None,
         tgdd: key(vals, "TGDD"),
         dgpu_active: false,
     })
@@ -167,7 +168,7 @@ fn write_status(mode: &str, ctl: &Controller, r: &Reading) {
 }
 
 const CSV_HEAD: &str = "timestamp,unix_time,mode,cmd_rpm,reason,pred_ts1s_max,kf_ambient,kf_H,kf_C,kf_S,replica_bias,power_mode,fan_ceiling,\
-cpu_pl1_w,cpu_cores_w,dgpu_cap_w,dgpu_active,heat_w,sustainable_w,rapl_pkg_w,rapl_core_w,rapl_gfx_w,igpu_act_mhz,igpu_req_mhz,cpu_busy_pct,cpu_iowait_pct,wifi_mb_s";
+cpu_pl1_w,cpu_cores_w,dgpu_cap_w,dgpu_active,heat_w,sustainable_w,rapl_pkg_w,rapl_core_w,rapl_gfx_w,igpu_act_mhz,igpu_req_mhz,cpu_busy_pct,cpu_iowait_pct,wifi_mb_s,cpu_core_c";
 
 /// Extra per-second measurements for the CSV (live only).
 #[derive(Default)]
@@ -176,6 +177,7 @@ struct Extra {
     igpu: Option<(f64, f64)>,
     cpu: Option<(f64, f64)>,
     wifi: Option<f64>,
+    cores_c: Option<f64>,
 }
 
 fn csv_row(mode: &str, ctl: &Controller, vals: &[Option<f64>], unix: f64, dgpu_active: bool, x: &Extra) -> String {
@@ -207,7 +209,7 @@ fn csv_row(mode: &str, ctl: &Controller, vals: &[Option<f64>], unix: f64, dgpu_a
     let pair = |v: Option<(f64, f64)>| v.map_or(",".to_owned(), |(a, b)| format!("{a:.2},{b:.2}"));
     let wifi = x.wifi.map_or(String::new(), |w| format!("{w:.3}"));
     let rapl = x.rapl.map_or(",,".to_owned(), |[p, c, g]| format!("{p:.2},{c:.2},{g:.2}"));
-    row.push_str(&format!(",{rapl},{},{},{wifi}", pair(x.igpu), pair(x.cpu)));
+    row.push_str(&format!(",{rapl},{},{},{wifi},{}", pair(x.igpu), pair(x.cpu), opt(x.cores_c)));
     for v in vals {
         row.push(',');
         if let Some(v) = v {
@@ -312,12 +314,13 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
                         }
                     }
                     r.dgpu_active = dgpu.as_ref().is_some_and(|d| d.active());
+                    r.cores_c = hw::core_temp_avg();
                     if resumed {
                         println!("resume detected: model state reset");
                         ctl.reset(&r);
                     }
                     let cmd = ctl.tick(&r);
-                    let extra = Extra { rapl: meter.read(), igpu: hw::igpu_mhz(), cpu: cpu_meter.read(), wifi: wifi_meter.read() };
+                    let extra = Extra { rapl: meter.read(), igpu: hw::igpu_mhz(), cpu: cpu_meter.read(), wifi: wifi_meter.read(), cores_c: r.cores_c };
                     if !shadow {
                         fans.set(cmd)?;
                         match ctl.caps {
@@ -455,6 +458,7 @@ fn run_replay(cfg: Config, cfg_dir: &Path, path: &Path, trace: bool, mode: Optio
             .collect();
         let Some(mut r) = vals.as_deref().and_then(|v| reading(v, uses_pm).ok()) else { continue };
         r.dgpu_active = r.p.pg > 1.0;
+        r.cores_c = num(row, "cpu_core_c");
         let Some(t) = row.get(t_col).and_then(|s| s.parse::<f64>().ok()) else { continue };
         if prev_t.is_some_and(|p| t - p > 8.0) {
             ctl.reset(&r);

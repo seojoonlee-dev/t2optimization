@@ -251,6 +251,23 @@ impl RaplMeter {
     }
 }
 
+/// Mean temperature of the CPU cores (coretemp's "Core N" inputs), °C.
+pub fn core_temp_avg() -> Option<f64> {
+    let hw = std::fs::read_dir("/sys/class/hwmon").ok()?.flatten().map(|e| e.path()).find(|p| rd(&p.join("name").to_string_lossy()).is_ok_and(|n| n == "coretemp"))?;
+    let (mut sum, mut n) = (0.0, 0u32);
+    for e in std::fs::read_dir(&hw).ok()?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(base) = name.strip_suffix("_label") else { continue };
+        if !rd(&e.path().to_string_lossy()).is_ok_and(|l| l.starts_with("Core ")) {
+            continue;
+        }
+        if let Some(mc) = rd(&hw.join(format!("{base}_input")).to_string_lossy()).ok().and_then(|v| v.parse::<f64>().ok()) {
+            (sum, n) = (sum + mc / 1000.0, n + 1);
+        }
+    }
+    (n > 0).then(|| sum / n as f64)
+}
+
 /// The iGPU's actual and requested clock (MHz), for logging.
 pub fn igpu_mhz() -> Option<(f64, f64)> {
     let cards = std::fs::read_dir("/sys/class/drm").ok()?;
