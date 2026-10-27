@@ -10,6 +10,14 @@ model = "../models/rc3m-c.json"
 # the model's 90 s error is ~0.4 °C rms, so 44.6 leaves about one sigma.
 ceiling_c = 44.6
 
+# extra heat (integral action) isn't lowered while Ts1S, under the ceiling,
+# has risen more than heat_rising_c in the last heat_rising_s: the plan brings
+# Ts1S up to the ceiling over minutes, and reading that climb as "less heat"
+# loosened the caps and overshot to 45.5 °C in balanced compiles (sim,
+# 2026-10-27; user picked these values)
+heat_rising_s = 30
+heat_rising_c = 0.05
+
 # eco keeps the CPU package around this on average (RAPL W), bursting to the
 # PL1 maximum for ~eco_burst_s once it has been under it for a while
 # (user, 2026-10-24: 6-10 W sustained, still boosting when needed). The iGPU
@@ -46,3 +54,9 @@ cpu_floor_c = [90.0, 100.0]
 # the first crossing by 2 s. Logs without the core mean fall back to TCMX.
 cpu_floor_avg_s = 1
 gpu_floor_c = [90.0, 100.0]
+
+# fan ceilings per mode (mean rpm): plans stay under these; safety floors may
+# go past. balanced 3300 -> 3500 (user, 2026-10-27): ~+0.9 W sustained in sim
+[fan_ceiling_rpm]
+eco = 2500
+balanced = 3500

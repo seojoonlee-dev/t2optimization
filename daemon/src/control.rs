@@ -43,6 +43,11 @@ pub struct Config {
     pub heat_gain: f64,
     pub heat_max_w: f64,
     pub heat_fade_s: f64,
+    /// under the ceiling, extra heat isn't lowered while Ts1S has risen more
+    /// than heat_rising_c over the last heat_rising_s: the plan only brings
+    /// Ts1S up to the ceiling over minutes, so it is still on its way
+    pub heat_rising_s: u32,
+    pub heat_rising_c: f64,
     /// extra margin a slower fan speed needs before the fans come down
     pub down_hysteresis_c: f64,
     pub horizon_s: u32,
@@ -124,7 +129,7 @@ pub struct FanCeilings {
 
 impl Default for FanCeilings {
     fn default() -> Self {
-        Self { eco: 2500, balanced: 3300, perf: 99999 }
+        Self { eco: 2500, balanced: 3500, perf: 99999 }
     }
 }
 
@@ -201,6 +206,8 @@ impl Default for Config {
             heat_gain: 0.1,
             heat_max_w: 20.0,
             heat_fade_s: 1800.0,
+            heat_rising_s: 30,
+            heat_rising_c: 0.05,
             down_hysteresis_c: 0.15,
             horizon_s: 90,
             plan_every_s: 5,
@@ -493,6 +500,7 @@ pub struct Controller {
     zone_hist: VecDeque<Power>,
     /// the CPU floor's input over the last cpu_floor_avg_s
     cpu_hist: VecDeque<f64>,
+    ts1s_hist: VecDeque<f64>,
     started: bool,
     t: u32,
     pub mode: Mode,
@@ -528,6 +536,7 @@ impl Controller {
             panic: false,
             zone_hist: VecDeque::with_capacity(61),
             cpu_hist: VecDeque::new(),
+            ts1s_hist: VecDeque::new(),
             started: false,
             t: 0,
             mode: Mode::Balanced,
@@ -596,6 +605,7 @@ impl Controller {
         self.rep.reset(&r.y);
         self.zone_hist.clear();
         self.cpu_hist.clear();
+        self.ts1s_hist.clear();
         self.t = 0;
         self.cmd = r.rpm.clamp(self.lo, self.hi);
         self.plan_rpm = self.cmd;
@@ -610,12 +620,21 @@ impl Controller {
     /// download, model error at this load), so it becomes extra heat in every
     /// prediction. Time over the ceiling always counts; time under it only
     /// with the fans no faster than the plan (not while they come down from
-    /// a safety floor), and it fades once the load is gone.
+    /// a safety floor) and Ts1S no longer rising, and it fades once the load
+    /// is gone.
     fn integrate_heat(&mut self, r: &Reading, fan_max: f64) {
         let cfg = &self.cfg;
         let limited = self.plan_reason == "power-cap" || r.ts1s > cfg.ceiling_c;
+        self.ts1s_hist.push_back(r.ts1s);
+        if self.ts1s_hist.len() > cfg.heat_rising_s as usize + 1 {
+            self.ts1s_hist.pop_front();
+        }
+        // still climbing towards the ceiling: no evidence of less heat yet
+        // (counting it ran extra heat to -5 W and overshot to 45.5 °C, 2026-10-27)
+        let rising = r.ts1s - self.ts1s_hist[0] > cfg.heat_rising_c;
         let h = &mut self.planner.heat;
-        if limited && (r.ts1s > cfg.ceiling_c || self.cmd <= fan_max + cfg.rpm_step as f64) {
+        let over = r.ts1s > cfg.ceiling_c;
+        if limited && (over || (!rising && self.cmd <= fan_max + cfg.rpm_step as f64)) {
             *h = (*h + cfg.heat_gain * (r.ts1s - cfg.ceiling_c)).clamp(-cfg.heat_max_w, cfg.heat_max_w);
         } else if !limited {
             *h *= (-1.0 / cfg.heat_fade_s).exp();
