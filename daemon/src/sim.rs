@@ -28,15 +28,15 @@ use crate::{rapl_limits, reading, KEYS};
 const DIE_K_PER_W: f64 = 0.4;
 
 /// The SMC's skin limiter (sim/smc.py, reverse-engineered 2026-10-19).
-struct Limiter {
-    i: f64,
-    j: f64,
-    pz0f: f64,
+pub struct Limiter {
+    pub i: f64,
+    pub j: f64,
+    pub pz0f: f64,
 }
 
 impl Limiter {
     /// One second at skin estimate `ts1s` and zone power `zone` (PC0R + PG0R); returns (PZ0E, PZ0T).
-    fn step(&mut self, ts1s: f64, zone: f64) -> (f64, f64) {
+    pub fn step(&mut self, ts1s: f64, zone: f64) -> (f64, f64) {
         let e = ts1s - 44.985;
         self.i = (self.i + 0.05925 * e).max(0.0);
         let pz0e = (70.0 - 12.19 * e - self.i).clamp(0.0, 70.0);
@@ -160,7 +160,7 @@ pub fn run_sim(cfg: Config, cfg_dir: &Path, path: &Path, a: SimArgs) -> Result<(
         let cores_capped = matches!((num(row, "rapl_core_w"), num(row, "cpu_cores_w")), (Some(d), Some(c)) if d >= c - 1.0);
         let pc_want = if cores_capped || capped(Some(pkg_logged), num(row, "cpu_pl1_w"), pl1_max) { pc0r_from_pkg(pl1_max) } else { r.p.pc };
         let pg_want = if capped(Some(r.p.pg), num(row, "dgpu_cap_w"), gpu_max) { gpu_max } else { r.p.pg };
-        let want = Power { pc: pc_want, pg: pg_want, pm: r.p.pm };
+        let want = Power { pc: pc_want, pg: pg_want, ..r.p };
 
         if !started {
             started = true;
@@ -186,16 +186,16 @@ pub fn run_sim(cfg: Config, cfg_dir: &Path, path: &Path, a: SimArgs) -> Result<(
         let (pz0e, pz0t) = lim.step(ts1s, last_p.pc + last_p.pg);
         let dh = if a.inject { x[0] - shadow[0] } else { 0.0 };
         let die = |t: Option<f64>| t.map(|t| t + dh + DIE_K_PER_W * (last_p.pc - r.p.pc));
-        let sr = Reading { y, ts1s, pz0t, p: *last_p, rpm: *rpm, tcmx: die(r.tcmx), cores_c: die(num(row, "cpu_core_c")), tgdd: r.tgdd, dgpu_active: want.pg > 1.0 };
+        let sr = Reading { y, ts1s, pz0t, p: *last_p, rpm: *rpm, tcmx: die(r.tcmx), cores_c: die(num(row, "cpu_core_c")), tgdd: r.tgdd, dgpu_active: want.pg > 1.0, core_max: None, pkg_w: None, core_w: None, busy: None };
         let cmd = ctl.tick(&sr);
         let pl1 = ctl.caps.map_or(ctl.cfg.warmup_pl1_w, |c| rapl_limits(&ctl.cfg, c.cpu).0);
         let gcap = ctl.caps.and_then(|c| c.gpu);
         // under the fence the cores get their limit and the rest of the
         // package what it drew in the log (the iGPU as logged, else idle)
         let fence = ctl.caps.and_then(|c| c.cores).map_or(f64::INFINITY, |w| w + ctl.cfg.eco_uncore_w + num(row, "rapl_gfx_w").unwrap_or(0.0));
-        let p = Power { pc: want.pc.min(pc0r_from_pkg(pl1.min(fence))), pg: gcap.map_or(want.pg, |g| want.pg.min(g)), pm: want.pm };
+        let p = Power { pc: want.pc.min(pc0r_from_pkg(pl1.min(fence))), pg: gcap.map_or(want.pg, |g| want.pg.min(g)), ..want };
         let k = a.plant_heat;
-        *x = model::advance(&plant.step(*rpm), x, Power { pc: k * p.pc, pg: k * p.pg, pm: k * p.pm });
+        *x = model::advance(&plant.step(*rpm), x, Power { pc: k * p.pc, pg: k * p.pg, pm: k * p.pm, ..p });
         *rpm += (cmd - *rpm) * (1.0 - (-1.0 / FAN_TAU_S).exp());
         *last_p = p;
         log.push(Sec { ts1s, pz0e, pz0t, rpm: *rpm, pl1, want: pkg_from_pc0r(want.pc), drawn: pkg_from_pc0r(p.pc) });

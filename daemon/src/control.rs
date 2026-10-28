@@ -67,6 +67,11 @@ pub struct Config {
     /// a one-second spike on a core or two doesn't set it
     pub cpu_floor_avg_s: u32,
     pub gpu_floor_c: [f64; 2],
+    /// the hottest CPU core must stay under this (the CPU's own thermal
+    /// throttle is at 100 °C; user, 2026-10-28). With a hottest-core model
+    /// (the model JSON's "die" block) the package limit PL2 is set every
+    /// second so the predicted hottest core holds it; without one, no limit
+    pub die_limit_c: f64,
     /// measured Ts1S this far above the set point -> fans past the mode's
     /// ceiling (full speed at cut_over_setpoint_c) until back under the ceiling
     pub panic_over_setpoint_c: f64,
@@ -193,6 +198,15 @@ pub struct Caps {
     pub cores: Option<f64>,
 }
 
+/// The CPU limits in RAPL terms (W), with the hottest-core limit on PL2
+/// (and PL1 no higher than PL2).
+pub fn rapl_with_die(pl1: f64, pl2: f64, die: Option<f64>) -> (f64, f64) {
+    match die {
+        Some(d) if d < pl2 => (pl1.min(d), d),
+        _ => (pl1, pl2),
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -219,6 +233,7 @@ impl Default for Config {
             cpu_floor_c: [90.0, 100.0],
             cpu_floor_avg_s: 1,
             gpu_floor_c: [90.0, 100.0],
+            die_limit_c: 98.0,
             panic_over_setpoint_c: 0.4,
             cut_over_setpoint_c: 1.5,
             default_mode: "balanced".into(),
@@ -297,6 +312,13 @@ pub struct Reading {
     pub tgdd: Option<f64>,
     /// dGPU awake (runtime PM active); its power cap only applies then
     pub dgpu_active: bool,
+    /// hottest CPU core (coretemp), °C
+    pub core_max: Option<f64>,
+    /// RAPL package and cores power over the last second, W
+    pub pkg_w: Option<f64>,
+    pub core_w: Option<f64>,
+    /// busy CPUs (sum of busy fractions over the last second)
+    pub busy: Option<f64>,
 }
 
 /// Split a CPU + dGPU budget by what each draws: headroom shared equally,
@@ -363,7 +385,7 @@ impl Planner {
         let hi = hi.min(cfg.zone_max_w).max(lo);
         let power = |total: f64| {
             let c = split(cfg, total, demand, dgpu_active);
-            Power { pc: c.cpu, pg: c.gpu.unwrap_or(demand.pg), pm: demand.pm }
+            Power { pc: c.cpu, pg: c.gpu.unwrap_or(demand.pg), ..demand }
         };
         let sus = bisect(lo, hi, |t| self.steady(m, kf, rep, power(t), fan) <= cfg.ceiling_c);
         let ps = power(sus);
@@ -513,6 +535,11 @@ pub struct Controller {
     energy_j: f64,
     /// sustainable CPU + dGPU power at the mode's fan ceiling (PC0R + PG0R W), last plan
     pub sustainable: f64,
+    /// package limit (RAPL W) that keeps the predicted hottest core at
+    /// die_limit_c, set every second; None without a hottest-core model or its inputs
+    pub die_cap: Option<f64>,
+    /// hottest core: measured minus modelled, followed with the model's feedback_tau_s
+    die_fb: f64,
 }
 
 impl Controller {
@@ -545,7 +572,26 @@ impl Controller {
             plan_caps: None,
             energy_j,
             sustainable: f64::NAN,
+            die_cap: None,
+            die_fb: 0.0,
         }
+    }
+
+    /// The package limit (RAPL W) for the next second that keeps the
+    /// predicted hottest core at die_limit_c, at this second's busy count.
+    /// Power outside the cores (uncore, iGPU) is taken as it is now.
+    fn die_limit(&mut self, r: &Reading) -> Option<f64> {
+        let die = self.model.die?;
+        let (core_w, pkg_w, busy) = (r.core_w?, r.pkg_w?, r.busy?);
+        let (x, amb) = (self.kf.nodes(), self.kf.ambient());
+        let base = die.base(x[0] + amb, x[1] + amb);
+        if let Some(t) = r.core_max {
+            let resid = t - (base + die.rise(core_w, busy));
+            self.die_fb += (resid - self.die_fb) * (1.0 - (-1.0 / die.feedback_tau_s).exp());
+        }
+        let core_max_w = die.max_core_w(self.cfg.die_limit_c - base - self.die_fb, busy);
+        let other = (pkg_w - core_w).max(0.0);
+        Some((core_max_w + other).clamp(self.cfg.cpu_pl1_min_w, self.cfg.cpu_pl1_max_w + self.cfg.pl2_extra_w))
     }
 
     /// Switch power mode; the next tick plans for it at once.
@@ -606,6 +652,7 @@ impl Controller {
         self.zone_hist.clear();
         self.cpu_hist.clear();
         self.ts1s_hist.clear();
+        self.die_fb = 0.0;
         self.t = 0;
         self.cmd = r.rpm.clamp(self.lo, self.hi);
         self.plan_rpm = self.cmd;
@@ -662,6 +709,8 @@ impl Controller {
         }
 
         let fan_max = cfg.fan_ceiling(self.mode).min(self.hi);
+        self.die_cap = self.die_limit(r);
+        let cfg = &self.cfg;
         // eco's energy budget: refills below the sustained power, drains above it
         let (sus, room) = (cfg.eco_sustained_w, cfg.cpu_pl1_max_w - cfg.eco_sustained_w);
         self.energy_j = (self.energy_j + sus - pkg_from_pc0r(r.p.pc)).clamp(0.0, room * cfg.eco_burst_s);
@@ -674,8 +723,8 @@ impl Controller {
             let mean = |n: usize| {
                 let it = self.zone_hist.iter().skip(self.zone_hist.len().saturating_sub(n));
                 let k = n.min(self.zone_hist.len()) as f64;
-                let s = it.fold(Power::default(), |s, p| Power { pc: s.pc + p.pc, pg: s.pg + p.pg, pm: s.pm + p.pm });
-                Power { pc: s.pc / k, pg: s.pg / k, pm: s.pm / k }
+                let s = it.fold(Power::default(), |s, p| Power { pc: s.pc + p.pc, pg: s.pg + p.pg, pm: s.pm + p.pm, io: s.io + p.io, chg: s.chg + p.chg });
+                Power { pc: s.pc / k, pg: s.pg / k, pm: s.pm / k, io: s.io / k, chg: s.chg / k }
             };
             let (m10, m60) = (mean(10), mean(60));
             // memory power follows the window CPU + dGPU power picked
@@ -686,7 +735,7 @@ impl Controller {
             // the fans plan for the power the caps (and eco's energy budget) let through
             let eco_pc = self.energy_cap().map_or(f64::INFINITY, |e| self.igpu_fence(e).0);
             let eco_pg = self.eco_gpu_cap().unwrap_or(f64::INFINITY);
-            let p = Power { pc: demand.pc.min(caps.cpu).min(eco_pc), pg: caps.gpu.map_or(demand.pg, |g| demand.pg.min(g).min(eco_pg)), pm: demand.pm };
+            let p = Power { pc: demand.pc.min(caps.cpu).min(eco_pc), pg: caps.gpu.map_or(demand.pg, |g| demand.pg.min(g).min(eco_pg)), ..demand };
             (self.plan_rpm, self.pred, self.plan_reason) =
                 self.planner.plan(cfg, &mut self.model, &self.kf, &self.rep, p, self.cmd, r.rpm, fan_max);
             // a load pressing against a cap that is below its maximum

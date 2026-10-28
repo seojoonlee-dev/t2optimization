@@ -26,6 +26,7 @@ mod hw;
 mod linalg;
 mod model;
 mod sim;
+mod synth;
 
 use std::fs::File;
 use std::io::{BufRead, BufReader, LineWriter, Write};
@@ -35,8 +36,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use control::{pkg_from_pc0r, Config, Controller, Mode, Reading};
-use model::{Model, Power, SENSORS, SETPOINT};
+use control::{pkg_from_pc0r, rapl_with_die, Config, Controller, Mode, Reading};
+use model::{Model, Power, IO_IDLE_W, SENSORS, SETPOINT};
 
 const STATUS: &str = "/run/t2opt-fand.json";
 const LOCK: &str = "/run/t2opt-fand.lock";
@@ -53,9 +54,13 @@ const KEYS: [&str; 16] = [
     "PM0C",
 ];
 const OPTIONAL: [&str; 2] = ["TGDD", "PM0C"];
+/// Read every second for the model (I/O = POLR + PORR + PSLC, charging =
+/// PDTR - PSTR) but not logged: logging is t2opt-extralog's job
+const INPUT_KEYS: [&str; 5] = ["POLR", "PORR", "PSLC", "PDTR", "PSTR"];
 
 fn key(vals: &[Option<f64>], name: &str) -> Option<f64> {
-    vals[KEYS.iter().position(|k| *k == name).expect("unknown key")]
+    let i = KEYS.iter().chain(&INPUT_KEYS).position(|k| *k == name).expect("unknown key");
+    vals.get(i).copied().flatten()
 }
 
 /// The controller's inputs from one row of key values, or the keys that are missing.
@@ -71,16 +76,29 @@ fn reading(vals: &[Option<f64>], uses_pm: bool) -> Result<Reading, Vec<&'static 
         return Err(missing);
     }
     let k = |n| key(vals, n).unwrap();
+    // logs carry no I/O or charge keys: idle I/O, not charging
+    let io = match (key(vals, "POLR"), key(vals, "PORR"), key(vals, "PSLC")) {
+        (Some(a), Some(b), Some(c)) => a + b + c,
+        _ => IO_IDLE_W,
+    };
+    let chg = match (key(vals, "PDTR"), key(vals, "PSTR")) {
+        (Some(d), Some(s)) => (d - s).max(0.0),
+        _ => 0.0,
+    };
     Ok(Reading {
         y: SENSORS.map(k),
         ts1s: k("Ts1S"),
         pz0t: k("PZ0T"),
-        p: Power { pc: k("PC0R"), pg: k("PG0R"), pm: if uses_pm { k("PM0C") } else { 0.0 } },
+        p: Power { pc: k("PC0R"), pg: k("PG0R"), pm: if uses_pm { k("PM0C") } else { 0.0 }, io, chg },
         rpm: (k("F0Ac") + k("F1Ac")) / 2.0,
         tcmx: key(vals, "TCMX"),
         cores_c: None,
         tgdd: key(vals, "TGDD"),
         dgpu_active: false,
+        core_max: None,
+        pkg_w: None,
+        core_w: None,
+        busy: None,
     })
 }
 
@@ -210,7 +228,8 @@ fn csv_row(mode: &str, ctl: &Controller, vals: &[Option<f64>], unix: f64, dgpu_a
     let wifi = x.wifi.map_or(String::new(), |w| format!("{w:.3}"));
     let rapl = x.rapl.map_or(",,".to_owned(), |[p, c, g]| format!("{p:.2},{c:.2},{g:.2}"));
     row.push_str(&format!(",{rapl},{},{},{wifi},{}", pair(x.igpu), pair(x.cpu), opt(x.cores_c)));
-    for v in vals {
+    // the model's extra inputs (INPUT_KEYS) aren't logged
+    for v in vals.iter().take(KEYS.len()) {
         row.push(',');
         if let Some(v) = v {
             row.push_str(&g4(*v));
@@ -245,8 +264,11 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
     let uses_pm = model.uses_pm;
     let mut ctl = Controller::new(cfg.clone(), model, fans.lo, fans.hi);
     // PM0C is only optional when the model doesn't take it
-    let optional: Vec<&str> = OPTIONAL.iter().copied().filter(|k| !(uses_pm && *k == "PM0C")).collect();
-    let smc = hw::SmcReader::open(&KEYS, &optional)?;
+    let mut optional: Vec<&str> = OPTIONAL.iter().copied().filter(|k| !(uses_pm && *k == "PM0C")).collect();
+    // the I/O and charge keys fall back to idle I/O / not charging if missing
+    optional.extend(INPUT_KEYS);
+    let all: Vec<&str> = KEYS.iter().chain(&INPUT_KEYS).copied().collect();
+    let smc = hw::SmcReader::open(&all, &optional)?;
     // amdgpu can register its card after fand starts at boot, so a miss is retried each tick
     let mut dgpu = hw::Dgpu::find();
     // an earlier build could leave the cores-only power limit on
@@ -293,6 +315,7 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
         let mut meter = hw::RaplMeter::new();
         let (mut cpu_meter, mut wifi_meter) = (hw::CpuMeter::new(), hw::WifiMeter::new());
         let mut lavd = hw::Lavd::new();
+        let ncpu = std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64);
         while !stop.load(Ordering::Relaxed) {
             next += Duration::from_secs(1);
             let vals = smc.read();
@@ -314,23 +337,31 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
                         }
                     }
                     r.dgpu_active = dgpu.as_ref().is_some_and(|d| d.active());
-                    r.cores_c = hw::core_temp_avg();
+                    let cores = hw::core_temps();
+                    r.cores_c = cores.map(|c| c.0);
+                    r.core_max = cores.map(|c| c.1);
+                    let (rapl, cpu) = (meter.read(), cpu_meter.read());
+                    r.pkg_w = rapl.map(|v| v[0]);
+                    r.core_w = rapl.map(|v| v[1]);
+                    r.busy = cpu.map(|c| c.0 / 100.0 * ncpu);
                     if resumed {
                         println!("resume detected: model state reset");
                         ctl.reset(&r);
                     }
                     let cmd = ctl.tick(&r);
-                    let extra = Extra { rapl: meter.read(), igpu: hw::igpu_mhz(), cpu: cpu_meter.read(), wifi: wifi_meter.read(), cores_c: r.cores_c };
+                    let extra = Extra { rapl, igpu: hw::igpu_mhz(), cpu, wifi: wifi_meter.read(), cores_c: r.cores_c };
                     if !shadow {
                         fans.set(cmd)?;
                         match ctl.caps {
                             Some(c) => {
                                 let (pl1, pl2) = rapl_limits(&cfg, c.cpu);
+                                let (pl1, pl2) = rapl_with_die(pl1, pl2, ctl.die_cap);
                                 hw::set_cpu_limits(pl1, pl2, cfg.pl1_window_s)?;
                                 hw::set_core_limit(c.cores, cfg.pl1_window_s)?;
                             }
                             None => {
-                                hw::set_cpu_limits(cfg.warmup_pl1_w, cfg.warmup_pl1_w + cfg.pl2_extra_w, cfg.pl1_window_s)?;
+                                let (pl1, pl2) = rapl_with_die(cfg.warmup_pl1_w, cfg.warmup_pl1_w + cfg.pl2_extra_w, ctl.die_cap);
+                                hw::set_cpu_limits(pl1, pl2, cfg.pl1_window_s)?;
                                 hw::set_core_limit(None, 0.0)?;
                             }
                         }
@@ -443,6 +474,7 @@ fn run_replay(cfg: Config, cfg_dir: &Path, path: &Path, trace: bool, mode: Optio
     ctl.set_mode(start_mode);
 
     let t0 = Instant::now();
+    let ncpu = std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64);
     let (mut pl1s, mut capped) = (Vec::new(), 0u32);
     let (mut cmds, mut acts, mut ts_max) = (Vec::new(), Vec::new(), f64::NEG_INFINITY);
     let mut reasons: Vec<(&str, u32)> = Vec::new();
@@ -459,6 +491,9 @@ fn run_replay(cfg: Config, cfg_dir: &Path, path: &Path, trace: bool, mode: Optio
         let Some(mut r) = vals.as_deref().and_then(|v| reading(v, uses_pm).ok()) else { continue };
         r.dgpu_active = r.p.pg > 1.0;
         r.cores_c = num(row, "cpu_core_c");
+        r.pkg_w = num(row, "rapl_pkg_w");
+        r.core_w = num(row, "rapl_core_w");
+        r.busy = num(row, "cpu_busy_pct").map(|b| b / 100.0 * ncpu);
         let Some(t) = row.get(t_col).and_then(|s| s.parse::<f64>().ok()) else { continue };
         if prev_t.is_some_and(|p| t - p > 8.0) {
             ctl.reset(&r);
@@ -507,6 +542,7 @@ fn run_replay(cfg: Config, cfg_dir: &Path, path: &Path, trace: bool, mode: Optio
 fn usage() -> ! {
     eprintln!("usage: t2opt-fand [--config FILE] [--shadow | --replay CSV [--trace] [--mode eco|balanced|perf] | --release]");
     eprintln!("       t2opt-fand [--config FILE] --sim CSV [--plant MODEL] [--plant-heat K] [--inject] [--from TIME] [--to TIME] [--mode M] [--out CSV]");
+    eprintln!("       t2opt-fand [--config FILE] --synth SCENARIO|all [--plant MODEL] [--die-bias K] [--mode M] [--out CSV]");
     std::process::exit(2)
 }
 
@@ -514,7 +550,8 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let mut config = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/fand.toml"));
     let (mut shadow, mut trace, mut release, mut replay, mut mode) = (false, false, false, None, None);
-    let (mut plant_heat, mut inject) = (1.0, false);
+    let (mut plant_heat, mut inject, mut die_bias) = (1.0, false, 0.0);
+    let mut synth: Option<String> = None;
     let (mut sim, mut plant, mut out): (Option<PathBuf>, Option<PathBuf>, Option<PathBuf>) = (None, None, None);
     let (mut from, mut to): (Option<String>, Option<String>) = (None, None);
     while let Some(a) = args.next() {
@@ -528,6 +565,8 @@ fn main() {
             "--plant" => plant = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
             "--plant-heat" => plant_heat = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--inject" => inject = true,
+            "--synth" => synth = Some(args.next().unwrap_or_else(|| usage())),
+            "--die-bias" => die_bias = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| usage()),
             "--from" => from = Some(args.next().unwrap_or_else(|| usage())),
             "--to" => to = Some(args.next().unwrap_or_else(|| usage())),
             "--out" => out = Some(PathBuf::from(args.next().unwrap_or_else(|| usage()))),
@@ -554,6 +593,9 @@ fn main() {
                 eprintln!("core limit: {e}");
             }
             hw::Fans::open().map(|f| f.release())
+        } else if let Some(sc) = synth.as_deref() {
+            let a = synth::SynthArgs { scenario: sc, plant: plant.as_deref(), die_bias, mode, out: out.as_deref() };
+            synth::run_synth(cfg, &cfg_dir, a)
         } else if let Some(csv) = sim {
             let a = sim::SimArgs { plant: plant.as_deref(), plant_heat, inject, from: from.as_deref(), to: to.as_deref(), mode, out: out.as_deref() };
             sim::run_sim(cfg, &cfg_dir, &csv, a)
