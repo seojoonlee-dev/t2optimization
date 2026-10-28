@@ -679,10 +679,17 @@ impl Controller {
         // still climbing towards the ceiling: no evidence of less heat yet
         // (counting it ran extra heat to -5 W and overshot to 45.5 °C, 2026-10-27)
         let rising = r.ts1s - self.ts1s_hist[0] > cfg.heat_rising_c;
+        // anti-windup: with both caps already at their floors, more extra heat
+        // can't cut anything; a hot start after a reboot wound it to +13.5 W in
+        // ~90 s and left balanced ~13 W short for half an hour (2026-10-28)
+        let (cmin, _) = cfg.cpu_range();
+        let floored = self.caps.is_some_and(|c| c.cpu <= cmin + 0.01 && c.gpu.is_none_or(|g| g <= cfg.dgpu_cap_min_w + 0.01));
         let h = &mut self.planner.heat;
         let over = r.ts1s > cfg.ceiling_c;
         if limited && (over || (!rising && self.cmd <= fan_max + cfg.rpm_step as f64)) {
-            *h = (*h + cfg.heat_gain * (r.ts1s - cfg.ceiling_c)).clamp(-cfg.heat_max_w, cfg.heat_max_w);
+            let step = cfg.heat_gain * (r.ts1s - cfg.ceiling_c);
+            let step = if floored { step.min(0.0) } else { step };
+            *h = (*h + step).clamp(-cfg.heat_max_w, cfg.heat_max_w);
         } else if !limited {
             *h *= (-1.0 / cfg.heat_fade_s).exp();
         }
