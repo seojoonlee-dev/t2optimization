@@ -2,9 +2,14 @@
 # Paths are relative to this file's directory.
 # Restart the daemon to apply changes.
 
-# rc3m-c: rc3-v1 + a memory node fed by PM0C (2026-10-20); rc3-v1 is the
-# fallback if this misbehaves
-model = "../models/rc3m-c.json"
+# rc3mwb-a: rc3m + I/O (Wi-Fi + SSD path rails) and battery-charge nodes, all
+# params refit on all logs, with a hottest-core model (2026-10-28); rc3m-c is
+# the fallback if this misbehaves
+model = "../models/rc3mwb-a.json"
+
+# the hottest core is kept under this by setting PL2 every second (the CPU's
+# own thermal throttle is at 100 °C; user, 2026-10-28)
+die_limit_c = 98.0
 
 # Ts1S the plan must stay under. The SMC's budget set point is 44.989 °C, and
 # the model's 90 s error is ~0.4 °C rms, so 44.6 leaves about one sigma.
