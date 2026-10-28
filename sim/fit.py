@@ -6,12 +6,23 @@
 The loss is free-run simulation error over whole segments (not one-step
 prediction), since the controller relies on ~90 s look-ahead. The session log
 after data.VALIDATION_START is never seen by the fit.
+
+The free runs are spread over one worker process per CPU: every (trial
+parameter vector, segment) run of a finite-difference Jacobian is a separate
+task, so the long overnight segments don't leave the other CPUs idle.
 """
 
 import json
+import multiprocessing as mp
+import os
 import sys
 import time
 from pathlib import Path
+
+# the parallelism is the worker processes; library threads on top of them
+# only fight over the CPUs (must be set before numpy loads)
+for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMBA_NUM_THREADS"):
+    os.environ.setdefault(_var, "1")
 
 import numpy as np
 from scipy.optimize import least_squares
@@ -24,6 +35,22 @@ MODELS = ROOT / "models"
 # per-log room temperature vs the stress log, K; wider bounds let the shift
 # soak up model error (it fit +4..+10 K for logs from the same day)
 MAX_AMBIENT_SHIFT = 3.0
+# residuals are scored every RES_STEP s (weighted by it): with 53 h of logs a
+# 1 s step made the least-squares Jacobian ~15 GB and ran out of memory
+# (2026-10-28); the sensors' filters are 16 s and slower
+RES_STEP = 5
+WORKERS = os.cpu_count() or 1
+
+# the Problem being fitted; the fork workers inherit it, so a task only
+# carries its segment index and parameters
+_PROB = None
+
+
+def _simulate_segment(task):
+    i, params, x0, full = task
+    s = _PROB.segs[i]
+    states = ThermalModel(_PROB.topo, params, {}, {}).simulate(x0, s.pc, s.pg, s.rpm, s.pm, s.io, s.chg)
+    return states if full else states[_PROB.rows[i]]
 
 
 def _masks(seg):
@@ -45,8 +72,16 @@ class Problem:
         self.n_dyn = len(self.specs)
         self.n_nodes = len(topo.nodes)
         self.masks = [_masks(s) for s in segs]
-        # each sample weighs the seconds it stands for (session SMC data is 10 s)
-        self.weights = [train * s.step for s, (train, _) in zip(segs, self.masks)]
+        # each sample weighs the seconds it stands for (session SMC data is 10 s;
+        # elsewhere every RES_STEP-th second stands for RES_STEP)
+        def sampled(s, train):
+            if s.step >= RES_STEP:
+                return train * s.step
+            keep = np.zeros(len(train), bool)
+            keep[::RES_STEP] = True
+            return (train & keep) * float(RES_STEP)
+
+        self.weights = [sampled(s, train) for s, (train, _) in zip(segs, self.masks)]
         # then each log file gets an equal share: 4.5 h of quiet overnight data
         # otherwise outweighs the short heavy-load logs and the fit gives up
         # accuracy where the controller matters most
@@ -57,6 +92,22 @@ class Problem:
         self.weights = [w * share / totals[s.source] for s, w in zip(segs, self.weights)]
         # room temperature differs per log file; the stress log is the reference
         self.sources = sorted({s.source for s in segs} - {"stress"})
+        # the residual rows of each segment
+        self.rows = [np.flatnonzero(w > 0) for w in self.weights]
+        # longest first, so the pool doesn't end on one long segment
+        self.order = sorted(range(len(segs)), key=lambda i: -len(segs[i]))
+        self.pool = None
+        global _PROB
+        _PROB = self
+
+    def start_workers(self):
+        self.pool = mp.get_context("fork").Pool(WORKERS)
+
+    def stop_workers(self):
+        if self.pool:
+            self.pool.close()
+            self.pool.join()
+            self.pool = None
 
     # parameter vector: log(dynamic params) | ambient shift per source | x0 per segment
     def initial(self):
@@ -87,25 +138,63 @@ class Problem:
     def ambient(self, seg, shift):
         return shift.get(seg.source, 0.0)
 
+    def simulate_many(self, vs, full=False):
+        """(model, states, shift, x0s) for each parameter vector in vs. States
+        are the residual rows only unless `full`."""
+        unpacked = [self.unpack(v) for v in vs]
+        tasks = [(j, i) for i in self.order for j in range(len(vs))]
+        args = [(i, unpacked[j][0], unpacked[j][2][i], full) for j, i in tasks]
+        runs = self.pool.imap(_simulate_segment, args) if self.pool else map(_simulate_segment, args)
+        states = [[None] * len(self.segs) for _ in vs]
+        for (j, i), st in zip(tasks, runs):
+            states[j][i] = st
+        out = []
+        for (params, shift, x0s), sts in zip(unpacked, states):
+            model = ThermalModel(self.topo, params, {}, {})
+            rows = [slice(None) if full else r for r in self.rows]
+            ys = [{k: s.y[k][r] - self.ambient(s, shift) for k in smc.SENSORS} for s, r in zip(self.segs, rows)]
+            ws = [w[r] for w, r in zip(self.weights, rows)]
+            model.out_w, model.out_d = solve_outputs(sts, ys, ws)
+            out.append((model, sts, shift, x0s))
+        return out
+
     def simulate(self, v):
-        params, shift, x0s = self.unpack(v)
-        model = ThermalModel(self.topo, params, {}, {})
-        states = [model.simulate(x0, s.pc, s.pg, s.rpm, s.pm) for s, x0 in zip(self.segs, x0s)]
-        ys = [{k: s.y[k] - self.ambient(s, shift) for k in smc.SENSORS} for s in self.segs]
-        out_w, out_d = solve_outputs(states, ys, self.weights)
-        model.out_w, model.out_d = out_w, out_d
-        return model, states, shift, x0s
+        return self.simulate_many([v], full=True)[0]
+
+    def sparsity(self):
+        """Which parameters move which residuals: dynamic params all of them,
+        a log's room shift its own segments, a segment's start state its own
+        rows. (The output map couples everything a little; ignored here, so
+        least_squares nudges all segments' start states in one pass.)"""
+        from scipy.sparse import lil_matrix
+
+        k = self.n_dyn + len(self.sources)
+        rows, r0 = [], 0
+        for s, w in zip(self.segs, self.weights):
+            n = int((w > 0).sum()) * len(smc.SENSORS)
+            rows.append((r0, r0 + n))
+            r0 += n
+        m = lil_matrix((r0, k + self.n_nodes * len(self.segs)), dtype=bool)
+        m[:, : self.n_dyn] = True
+        for i, (s, (a, b)) in enumerate(zip(self.segs, rows)):
+            if s.source in self.sources:
+                m[a:b, self.n_dyn + self.sources.index(s.source)] = True
+            m[a:b, k + i * self.n_nodes : k + (i + 1) * self.n_nodes] = True
+        return m
+
+    def residuals_many(self, vs):
+        out = []
+        for model, states, shift, _ in self.simulate_many(vs):
+            res = []
+            for s, st, w, r in zip(self.segs, states, self.weights, self.rows):
+                pred = model.sensors(st)
+                for k in smc.SENSORS:
+                    res.append((pred[k] - (s.y[k][r] - self.ambient(s, shift))) * np.sqrt(w[r]))
+            out.append(np.concatenate(res))
+        return out
 
     def residuals(self, v):
-        model, states, shift, _ = self.simulate(v)
-        res = []
-        for s, st, w in zip(self.segs, states, self.weights):
-            pred = model.sensors(st)
-            m = w > 0
-            for k in smc.SENSORS:
-                y = s.y[k] - self.ambient(s, shift)
-                res.append((pred[k][m] - y[m]) * np.sqrt(w[m]))
-        return np.concatenate(res)
+        return self.residuals_many([v])[0]
 
 
 def evaluate(problem, v):
@@ -155,13 +244,30 @@ def fit(name, segs, warm=None, free=None):
         unknown = set(free) - {p for p, *_ in prob.specs}
         if unknown:
             raise SystemExit(f"unknown params: {sorted(unknown)}")
-        # least_squares needs lo < hi, so pin frozen params to a sliver around their value
+    # frozen params stay at the warm model's values and out of the solve
+    # (pinning them with near-equal bounds made each step's solve crawl)
+    keep = np.ones(len(v0), bool)
+    if free is not None:
         for i, (pname, *_) in enumerate(prob.specs):
-            if pname not in free:
-                bounds[0][i], bounds[1][i] = v0[i] - 1e-9, v0[i] + 1e-9
+            keep[i] = pname in free
+
+    def full(z):
+        v = v0.copy()
+        v[keep] = z
+        return v
+
     t = time.time()
-    sol = least_squares(prob.residuals, v0, bounds=bounds, x_scale="jac", max_nfev=400, verbose=0)
-    model, rows = evaluate(prob, sol.x)
+    prob.start_workers()
+    try:
+        # verbose=2: one line per step (cost, step size, optimality), for long fits.
+        # workers: the Jacobian's trial vectors all go to the pool at once
+        sol = least_squares(lambda z: prob.residuals(full(z)), v0[keep], bounds=(bounds[0][keep], bounds[1][keep]),
+                            x_scale="jac", max_nfev=400, verbose=2, jac_sparsity=prob.sparsity()[:, keep],
+                            workers=lambda _, zs: prob.residuals_many([full(z) for z in zs]))
+        sol.x = full(sol.x)
+        model, rows = evaluate(prob, sol.x)
+    finally:
+        prob.stop_workers()
     return prob, sol, model, rows, time.time() - t
 
 
@@ -177,6 +283,7 @@ def main(names, warm=None, free=None, out=None):
     segs = data.load_all(test=False)
     MODELS.mkdir(exist_ok=True)
     for name in names:
+        print(f"fitting {name} on {len(segs)} segments ({time.strftime('%H:%M:%S')})", flush=True)
         prob, sol, model, rows, dt = fit(name, segs, warm, free)
         n_par = len(sol.x)
         print(f"\n== {name}: cost {sol.cost:.1f}, {sol.nfev} evals, {dt:.0f} s, {n_par} params ({prob.n_dyn} dynamic), status {sol.status}")

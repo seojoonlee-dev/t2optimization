@@ -19,7 +19,7 @@ from .thermal import ThermalModel, fan_feature
 HORIZONS = (30, 60, 90, 180)
 SENSOR_NOISE = 0.3  # K, rms
 # process noise per second, per node; slow nodes drift less
-PROCESS_NOISE = {"H": 0.05, "Hc": 0.05, "Hg": 0.05, "F": 0.05, "C": 0.02, "S": 0.005, "M": 0.05}
+PROCESS_NOISE = {"H": 0.05, "Hc": 0.05, "Hg": 0.05, "F": 0.05, "C": 0.02, "S": 0.005, "M": 0.05, "W": 0.05, "B": 0.05}
 # room temperature is an extra random-walk state: unknown on a new day, drifts slowly
 AMBIENT_NOISE = 0.003
 TEST_WARMUP = 300  # s of filtering from a cold start before scoring
@@ -30,8 +30,8 @@ class Kalman:
 
     def __init__(self, model):
         self.model = model
-        cinv, gmat, ga0, ga1, bpc, bpg, bpm = model.topo.build(model.params)
-        self.cinv, self.gmat, self.ga0, self.ga1, self.bpc, self.bpg, self.bpm = cinv, gmat, ga0, ga1, bpc, bpg, bpm
+        cinv, gmat, ga0, ga1, bmat = model.topo.build(model.params)
+        self.cinv, self.gmat, self.ga0, self.ga1, self.bmat = cinv, gmat, ga0, ga1, bmat
         self.n = len(cinv)
         w = np.array([model.out_w[k] for k in smc.SENSORS])
         self.h = np.hstack([w, np.ones((len(smc.SENSORS), 1))])
@@ -39,11 +39,11 @@ class Kalman:
         self.q = np.diag([PROCESS_NOISE[k] ** 2 for k in model.topo.nodes] + [AMBIENT_NOISE**2])
         self.r = np.eye(len(smc.SENSORS)) * SENSOR_NOISE**2
 
-    def step_matrices(self, pc, pg, rpm, pm=0.0):
+    def step_matrices(self, pc, pg, rpm, pm=0.0, io=0.0, chg=0.0):
         """Exact 1 s discretisation with inputs held constant."""
         f = fan_feature(np.array(rpm), self.model.params["fan_exp"])
         m = self.cinv[:, None] * (self.gmat - np.diag(self.ga0 + self.ga1 * f + self.gmat.sum(axis=1)))
-        b = self.cinv * (self.bpc * pc + self.bpg * pg + self.bpm * pm)
+        b = self.cinv * (self.bmat @ np.array([pc, pg, pm, io, chg], float))
         aug = np.zeros((self.n + 1, self.n + 1))
         aug[: self.n, : self.n] = m
         aug[: self.n, self.n] = b
@@ -63,7 +63,9 @@ class Kalman:
         for t in range(n_t):
             if t > 0:
                 pm = 0.0 if seg.pm is None else seg.pm[t - 1]
-                a, b = self.step_matrices(seg.pc[t - 1], seg.pg[t - 1], seg.rpm[t - 1], pm)
+                io = 0.0 if seg.io is None else seg.io[t - 1]
+                chg = 0.0 if seg.chg is None else seg.chg[t - 1]
+                a, b = self.step_matrices(seg.pc[t - 1], seg.pg[t - 1], seg.rpm[t - 1], pm, io, chg)
                 a_full[: self.n, : self.n] = a
                 b_full[: self.n] = b
                 x = a_full @ x + b_full
@@ -108,7 +110,8 @@ def main(name):
             print(f"  ({seg.name}: no PM0C in this log, skipped)")
             continue
         val = _masks(seg)[1] if seg.name in fit_names else None
-        x0 = model.steady_state(seg.pc[0], seg.pg[0], seg.rpm[0], 0.0 if seg.pm is None else seg.pm[0])
+        x0 = model.steady_state(seg.pc[0], seg.pg[0], seg.rpm[0], 0.0 if seg.pm is None else seg.pm[0],
+                                seg.io[0] if seg.io is not None else 0.0, seg.chg[0] if seg.chg is not None else 0.0)
         xs, ambs = kf.run(seg, x0, 0.0, 25.0, 9.0)
         idx = np.arange(len(seg))
         meas = {
@@ -138,7 +141,9 @@ def main(name):
                     continue
                 model.ambient = ambs[t]
                 pm = None if seg.pm is None else seg.pm[t:end + 1]
-                st = model.simulate(xs[t], seg.pc[t:end + 1], seg.pg[t:end + 1], seg.rpm[t:end + 1], pm)
+                io = None if seg.io is None else seg.io[t:end + 1]
+                chg = None if seg.chg is None else seg.chg[t:end + 1]
+                st = model.simulate(xs[t], seg.pc[t:end + 1], seg.pg[t:end + 1], seg.rpm[t:end + 1], pm, io, chg)
                 pred = model.sensors(st)
                 # SMC filters and integrator start from their replayed state at t
                 fk = _ema_states(meas, resets, t)

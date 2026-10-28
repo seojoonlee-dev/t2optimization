@@ -2,7 +2,9 @@
 
 Each node i has a heat capacity C_i and a temperature x_i measured relative to
 ambient. Heat flows between linked nodes (fixed conductance), into nodes from
-CPU (PC0R) and dGPU (PG0R) power, and out to ambient through
+CPU (PC0R), dGPU (PG0R) and, per topology, memory (PM0C), I/O (Wi-Fi + SSD
+path rails POLR + PORR + PSLC) and battery charge (PDTR - PSTR) power, and
+out to ambient through
 g_i(rpm) = a0_i + a1_i * (rpm/1000)^k (a1 = 0 for nodes the fans don't reach;
 the exponent k is fitted, ~0.8 for textbook forced convection):
 
@@ -29,22 +31,23 @@ def fan_feature(rpm, exp):
 
 
 @numba.njit(cache=True)
-def _simulate(x0, pc, pg, pm, fan, cinv, gmat, ga0, ga1, bpc, bpg, bpm, nsub):
-    n_t = pc.shape[0]
+def _simulate(x0, u, fan, cinv, gmat, ga0, ga1, bmat, nsub):
+    """u: (n_t, k) power inputs; bmat: (n, k) where each input's heat goes."""
+    n_t = u.shape[0]
     n = x0.shape[0]
+    k_in = u.shape[1]
     out = np.empty((n_t, n))
     x = x0.copy()
     q = np.empty(n)
     h = 1.0 / nsub
     out[0] = x
     for t in range(1, n_t):
-        p_c = pc[t - 1]
-        p_g = pg[t - 1]
-        p_m = pm[t - 1]
         f = fan[t - 1]
         for _ in range(nsub):
             for i in range(n):
-                acc = bpc[i] * p_c + bpg[i] * p_g + bpm[i] * p_m - (ga0[i] + ga1[i] * f) * x[i]
+                acc = -(ga0[i] + ga1[i] * f) * x[i]
+                for j in range(k_in):
+                    acc += bmat[i, j] * u[t - 1, j]
                 for j in range(n):
                     acc += gmat[i, j] * (x[j] - x[i])
                 q[i] = acc
@@ -64,10 +67,12 @@ class Topology:
     pg_node: str  # where dGPU power goes
     board_node: str = "C"
     pm_node: str | None = None  # where memory power (PM0C) goes; None = not an input
+    io_node: str | None = None  # where I/O power (POLR + PORR + PSLC) goes
+    chg_node: str | None = None  # where battery charge power (PDTR - PSTR) goes
 
     def param_specs(self):
         """(name, init, low, high); all positive, fitted in log space."""
-        caps = {"H": 80.0, "Hc": 60.0, "Hg": 60.0, "F": 60.0, "C": 600.0, "S": 1500.0, "M": 20.0}
+        caps = {"H": 80.0, "Hc": 60.0, "Hg": 60.0, "F": 60.0, "C": 600.0, "S": 1500.0, "M": 20.0, "W": 20.0, "B": 20.0}
         specs = [(f"cap_{n}", caps[n], 0.5, 2e5) for n in self.nodes]
         specs += [(f"g_{a}_{b}", 1.0, 1e-3, 50.0) for a, b in self.edges]
         for n in self.nodes:
@@ -98,11 +103,19 @@ class Topology:
         bpm = np.zeros(n)
         if self.pm_node:
             bpm[idx[self.pm_node]] = 1.0
-        return cinv, gmat, ga0, ga1, bpc, bpg, bpm
+        bio = np.zeros(n)
+        if self.io_node:
+            bio[idx[self.io_node]] = 1.0
+        bch = np.zeros(n)
+        if self.chg_node:
+            bch[idx[self.chg_node]] = 1.0
+        # columns: CPU, dGPU, memory, I/O, charge
+        bmat = np.stack([bpc, bpg, bpm, bio, bch], 1)
+        return cinv, gmat, ga0, ga1, bmat
 
     def substeps(self, p, max_fan):
         """Explicit-Euler substeps so h stays well under the fastest time constant."""
-        cinv, gmat, ga0, ga1, *_ = self.build(p)
+        cinv, gmat, ga0, ga1, _ = self.build(p)
         g_tot = ga0 + ga1 * max_fan + gmat.sum(axis=1)
         tau_min = float(np.min(1.0 / (cinv * g_tot)))
         return max(1, math.ceil(3.0 / tau_min))
@@ -115,6 +128,19 @@ TOPOLOGIES = {
     # include; TM0P read ~2 K above rc3's prediction in a compile)
     "rc3m": Topology(
         "rc3m", ["H", "C", "S", "M"], [("H", "C"), ("C", "S"), ("M", "C")], ["H", "C", "M"], "H", "H", pm_node="M"
+    ),
+    # rc3m + I/O node W (Wi-Fi/SSD path rails) and charge node B: heat the
+    # 2026-10-28 relevance pass found under TW0P/TM0P with a ~2 min lag
+    "rc3mwb": Topology(
+        "rc3mwb",
+        ["H", "C", "S", "M", "W", "B"],
+        [("H", "C"), ("C", "S"), ("M", "C"), ("W", "C"), ("B", "C")],
+        ["H", "C", "M", "W", "B"],
+        "H",
+        "H",
+        pm_node="M",
+        io_node="W",
+        chg_node="B",
     ),
     # CPU and dGPU sides of the heatsink as separate nodes
     "rc4": Topology(
@@ -147,22 +173,23 @@ class ThermalModel:
         self.out_d = out_d  # sensor -> offset (absorbs the ambient of the fit data)
         self.ambient = ambient  # shift for a different ambient than the fit data
 
-    def simulate(self, x0, pc, pg, rpm, pm=None):
+    def simulate(self, x0, pc, pg, rpm, pm=None, io=None, chg=None):
         fan = fan_feature(rpm, self.params["fan_exp"])
-        cinv, gmat, ga0, ga1, bpc, bpg, bpm = self.topo.build(self.params)
+        cinv, gmat, ga0, ga1, bmat = self.topo.build(self.params)
         nsub = self.topo.substeps(self.params, float(fan.max()) if len(fan) else 0.0)
-        pm = np.zeros(len(pc)) if pm is None else pm
-        return _simulate(np.asarray(x0, float), pc, pg, pm, fan, cinv, gmat, ga0, ga1, bpc, bpg, bpm, nsub)
+        z = np.zeros(len(pc))
+        u = np.stack([pc, pg, z if pm is None else pm, z if io is None else io, z if chg is None else chg], 1)
+        return _simulate(np.asarray(x0, float), np.ascontiguousarray(u, float), fan, cinv, gmat, ga0, ga1, bmat, nsub)
 
     def sensors(self, states):
         return {k: states @ self.out_w[k] + self.out_d[k] + self.ambient for k in smc.SENSORS}
 
-    def steady_state(self, pc, pg, rpm, pm=0.0):
+    def steady_state(self, pc, pg, rpm, pm=0.0, io=0.0, chg=0.0):
         """Node temperatures for constant inputs held forever."""
-        cinv, gmat, ga0, ga1, bpc, bpg, bpm = self.topo.build(self.params)
+        cinv, gmat, ga0, ga1, bmat = self.topo.build(self.params)
         f = fan_feature(np.array(rpm), self.params["fan_exp"])
         a = np.diag(ga0 + ga1 * f + gmat.sum(axis=1)) - gmat
-        return np.linalg.solve(a, bpc * pc + bpg * pg + bpm * pm)
+        return np.linalg.solve(a, bmat @ np.array([pc, pg, pm, io, chg], float))
 
     def to_json(self):
         return json.dumps(
