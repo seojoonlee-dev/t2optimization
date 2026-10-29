@@ -311,6 +311,7 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
     }
     sd_notify("READY=1");
 
+    let mut clamp = if shadow { hw::Pl2Clamp::none() } else { hw::Pl2Clamp::open() };
     let res = (|| -> Result<(), String> {
         let mut next = Instant::now();
         let mut prev = (Instant::now(), now_unix());
@@ -323,6 +324,7 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
         let mut meter = hw::RaplMeter::new();
         let (mut cpu_meter, mut wifi_meter) = (hw::CpuMeter::new(), hw::WifiMeter::new());
         let mut lavd = hw::Lavd::new();
+        let mut clamp_due = true;
         let ncpu = std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64);
         while !stop.load(Ordering::Relaxed) {
             next += Duration::from_secs(1);
@@ -331,6 +333,7 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
             // Instant (CLOCK_MONOTONIC) stops in suspend, wall time doesn't: the
             // SMC was reset and the machine cooled, so start the model over
             let resumed = now.1 - prev.1 > now.0.duration_since(prev.0).as_secs_f64() + 5.0;
+            clamp_due |= resumed;
             prev = now;
             if let Some(m) = read_mode() {
                 ctl.set_mode(m);
@@ -360,18 +363,28 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
                     let extra = Extra { rapl, igpu: hw::igpu_mhz(), cpu, wifi: wifi_meter.read(), cores_c: r.cores_c };
                     if !shadow {
                         fans.set(cmd)?;
-                        match ctl.caps {
+                        let wrote = match ctl.caps {
                             Some(c) => {
                                 let (pl1, pl2) = rapl_limits(&cfg, c.cpu);
                                 let (pl1, pl2) = rapl_with_die(pl1, pl2, ctl.die_cap);
-                                hw::set_cpu_limits(pl1, pl2, cfg.pl1_window_s, cfg.pl_step_w)?;
+                                let wrote = hw::set_cpu_limits(pl1, pl2, cfg.pl1_window_s, cfg.pl_step_w)?;
                                 hw::set_core_limit(c.cores, cfg.pl1_window_s)?;
+                                wrote
                             }
                             None => {
                                 let (pl1, pl2) = rapl_with_die(cfg.warmup_pl1_w, cfg.warmup_pl1_w + cfg.pl2_extra_w, ctl.die_cap);
-                                hw::set_cpu_limits(pl1, pl2, cfg.pl1_window_s, cfg.pl_step_w)?;
+                                let wrote = hw::set_cpu_limits(pl1, pl2, cfg.pl1_window_s, cfg.pl_step_w)?;
                                 hw::set_core_limit(None, 0.0)?;
+                                wrote
                             }
+                        };
+                        // checked when the limits change and after a resume, not
+                        // every tick: each MSR read wakes CPU 0
+                        if wrote || clamp_due {
+                            if let Err(e) = clamp.ensure() {
+                                eprintln!("PL2 clamp: {e}");
+                            }
+                            clamp_due = false;
                         }
                         if cfg.lavd_profiles {
                             lavd.follow(ctl.mode);
@@ -444,7 +457,10 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
         if let Err(e) = hw::set_core_limit(None, 0.0) {
             eprintln!("core limit: {e}");
         }
-        println!("fans released to the SMC, core power limit off");
+        if let Err(e) = clamp.restore() {
+            eprintln!("PL2 clamp: {e}");
+        }
+        println!("fans released to the SMC, core power limit off, PL2 clamp as found");
         let st = serde_json::json!({ "time": now_unix(), "heat_w": ctl.heat(), "model": cfg.model });
         if let Err(e) = std::fs::write(HEAT, st.to_string()) {
             eprintln!("{HEAT}: {e}");

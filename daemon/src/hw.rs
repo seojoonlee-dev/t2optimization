@@ -242,6 +242,73 @@ pub fn set_cpu_limits(pl1_w: f64, pl2_w: f64, window_s: f64, step_w: f64) -> Res
     Ok(true)
 }
 
+/// PL2's clamp bit (MSR_PKG_POWER_LIMIT bit 48). Without it PL2 can't take
+/// the cores below about base clock: after 30 s idle, PL1 = PL2 = 8 W let a
+/// 16-thread load run ~40 W for ~5.5 s until PL1's 20 s average caught up;
+/// with it there was no burst (2026-10-29). The kernel never sets it.
+pub struct Pl2Clamp {
+    msr: Option<File>,
+    found: Option<bool>,
+}
+
+const MSR_PKG_POWER_LIMIT: u64 = 0x610;
+const PL2_CLAMP: u64 = 1 << 48;
+
+impl Pl2Clamp {
+    /// The package MSR through CPU 0 (the msr module is loaded if missing).
+    pub fn open() -> Self {
+        const DEV: &str = "/dev/cpu/0/msr";
+        if !std::path::Path::new(DEV).exists() {
+            let _ = std::process::Command::new("modprobe").arg("msr").status();
+        }
+        match OpenOptions::new().read(true).write(true).open(DEV) {
+            Ok(f) => Self { msr: Some(f), found: None },
+            Err(e) => {
+                eprintln!("{DEV}: {e} (PL2 clamp not set)");
+                Self { msr: None, found: None }
+            }
+        }
+    }
+
+    /// Touches nothing (shadow mode).
+    pub fn none() -> Self {
+        Self { msr: None, found: None }
+    }
+
+    fn read(f: &File) -> Result<u64, String> {
+        let mut b = [0u8; 8];
+        f.read_exact_at(&mut b, MSR_PKG_POWER_LIMIT).map_err(|e| format!("rdmsr 0x610: {e}"))?;
+        Ok(u64::from_le_bytes(b))
+    }
+
+    /// Sets the bit (or puts back the value found) unless it already is.
+    fn set(&self, on: bool) -> Result<(), String> {
+        let Some(f) = &self.msr else { return Ok(()) };
+        let v = Self::read(f)?;
+        let want = if on { v | PL2_CLAMP } else { v & !PL2_CLAMP };
+        if want != v {
+            f.write_all_at(&want.to_le_bytes(), MSR_PKG_POWER_LIMIT).map_err(|e| format!("wrmsr 0x610: {e}"))?;
+        }
+        Ok(())
+    }
+
+    /// Clamp on; the first call remembers what was there for restore().
+    pub fn ensure(&mut self) -> Result<(), String> {
+        if self.found.is_none() {
+            if let Some(f) = &self.msr {
+                let was = Self::read(f)? & PL2_CLAMP != 0;
+                self.found = Some(was);
+                println!("PL2 clamp on (was {})", if was { "on" } else { "off" });
+            }
+        }
+        self.set(true)
+    }
+
+    pub fn restore(&self) -> Result<(), String> {
+        self.found.map_or(Ok(()), |was| self.set(was))
+    }
+}
+
 const RAPL_CORE: &str = "/sys/class/powercap/intel-rapl:0:0";
 /// the "uncore" domain (PP1) is the iGPU
 const RAPL_GFX: &str = "/sys/class/powercap/intel-rapl:0:1";
