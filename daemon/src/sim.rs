@@ -107,6 +107,8 @@ pub fn run_sim(cfg: Config, cfg_dir: &Path, path: &Path, a: SimArgs) -> Result<(
     let gpu_max = cfg.dgpu_cap_max_w;
     let mut ctl = Controller::new(cfg, model, lo, hi);
     ctl.set_mode(start_mode);
+    // without --mode, fand logs switch modes where the user did
+    let mode_col = col("power_mode").filter(|_| a.mode.is_none());
 
     let mut out = match a.out {
         Some(p) => {
@@ -139,6 +141,9 @@ pub fn run_sim(cfg: Config, cfg_dir: &Path, path: &Path, a: SimArgs) -> Result<(
             .collect();
         let Some(mut r) = vals.as_deref().and_then(|v| reading(v, uses_pm).ok()) else { continue };
         r.dgpu_active = r.p.pg > 1.0;
+        if let Some(m) = mode_col.and_then(|i| row.get(i)).and_then(|s| Mode::parse(s)) {
+            ctl.set_mode(m);
+        }
         let in_window = a.from.is_none_or(|from| ts >= from);
         if !in_window || !started {
             // follow the log: plant filter and controller both see the real machine

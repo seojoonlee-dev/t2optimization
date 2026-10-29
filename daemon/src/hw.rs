@@ -225,12 +225,13 @@ impl Dgpu {
     }
 }
 
-/// CPU package limits (RAPL PL1 / PL2 / PL1 window). Rewritten only when they
-/// differ, so a firmware reset (e.g. after resume) is corrected next time.
-pub fn set_cpu_limits(pl1_w: f64, pl2_w: f64, window_s: f64) -> Result<bool, String> {
+/// CPU package limits (RAPL PL1 / PL2 / PL1 window). Rewritten only when one
+/// differs from what is set by `step_w` or more, so a firmware reset (e.g.
+/// after resume) is corrected next time and small moves aren't applied.
+pub fn set_cpu_limits(pl1_w: f64, pl2_w: f64, window_s: f64, step_w: f64) -> Result<bool, String> {
     let uw = |w: f64| (w * 1e6).round() as u64;
     let cur = |f: &str| rd(&format!("{RAPL}/{f}")).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-    let near = |a: u64, b: u64| a.abs_diff(b) < 250_000;
+    let near = |a: u64, b: u64| a.abs_diff(b) < uw(step_w);
     if near(cur("constraint_0_power_limit_uw"), uw(pl1_w)) && near(cur("constraint_1_power_limit_uw"), uw(pl2_w)) {
         return Ok(false);
     }

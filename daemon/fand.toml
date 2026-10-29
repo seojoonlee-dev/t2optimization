@@ -11,6 +11,32 @@ model = "../models/rc3mwb-a.json"
 # own thermal throttle is at 100 °C; user, 2026-10-28)
 die_limit_c = 98.0
 
+# caps move toward the plan's every second, at most this much up / down per
+# second while Ts1S is under the ceiling (over it they cut at once): cutting at
+# once made the dGPU go 10-22-14-22 W in a game; 2 W up / 1 W down per 5 s plan
+# showed as visible steps (user, 2026-10-28)
+cap_rise_w_per_s = 0.5
+cap_fall_w_per_s = 0.5
+
+# after a mode switch the caps go from where they were to the new mode's in a
+# straight line over this many seconds: at once was a jump, at the rate above
+# balanced -> eco took ~40 s (user: 5 s, changes visible right away)
+mode_switch_s = 5.0
+
+# fans go up at most this fast for the plan and a binding power cap (both
+# jumped, e.g. 2080 -> 3800 rpm a few seconds into a game); the safety floors
+# (die temperatures, Ts1S over, SMC throttle) still jump. 50 -> 100: at 50 a
+# switch to perf near the ceiling went 0.3 °C over (user, 2026-10-28)
+up_rpm_per_s = 100.0
+
+# extra heat is saved when fand stops and picked up by a start within this
+# many seconds, if the model is the same (user, 2026-10-28)
+heat_keep_s = 600
+
+# PL1/PL2 are only rewritten when one would move by at least this (W); the
+# hottest-core limit moved them ~37 times a minute at idle (user, 2026-10-28)
+pl_step_w = 0.5
+
 # Ts1S the plan must stay under. The SMC's budget set point is 44.989 °C, and
 # the model's 90 s error is ~0.4 °C rms, so 44.6 leaves about one sigma.
 ceiling_c = 44.6

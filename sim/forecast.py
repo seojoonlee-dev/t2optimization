@@ -30,14 +30,19 @@ class Kalman:
 
     def __init__(self, model):
         self.model = model
+        # a model's "kalman" block (tuned for it) overrides the values above
+        t = model.kalman or {}
+        noise = {**PROCESS_NOISE, **t.get("process_noise", {})}
+        sensor, ambient = t.get("sensor_noise", SENSOR_NOISE), t.get("ambient_noise", AMBIENT_NOISE)
+        self.p0, self.p0_ambient = t.get("p0", 25.0), t.get("p0_ambient", 9.0)
         cinv, gmat, ga0, ga1, bmat = model.topo.build(model.params)
         self.cinv, self.gmat, self.ga0, self.ga1, self.bmat = cinv, gmat, ga0, ga1, bmat
         self.n = len(cinv)
         w = np.array([model.out_w[k] for k in smc.SENSORS])
         self.h = np.hstack([w, np.ones((len(smc.SENSORS), 1))])
         self.d = np.array([model.out_d[k] for k in smc.SENSORS])
-        self.q = np.diag([PROCESS_NOISE[k] ** 2 for k in model.topo.nodes] + [AMBIENT_NOISE**2])
-        self.r = np.eye(len(smc.SENSORS)) * SENSOR_NOISE**2
+        self.q = np.diag([noise[k] ** 2 for k in model.topo.nodes] + [ambient**2])
+        self.r = np.eye(len(smc.SENSORS)) * sensor**2
 
     def step_matrices(self, pc, pg, rpm, pm=0.0, io=0.0, chg=0.0):
         """Exact 1 s discretisation with inputs held constant."""
@@ -112,7 +117,7 @@ def main(name):
         val = _masks(seg)[1] if seg.name in fit_names else None
         x0 = model.steady_state(seg.pc[0], seg.pg[0], seg.rpm[0], 0.0 if seg.pm is None else seg.pm[0],
                                 seg.io[0] if seg.io is not None else 0.0, seg.chg[0] if seg.chg is not None else 0.0)
-        xs, ambs = kf.run(seg, x0, 0.0, 25.0, 9.0)
+        xs, ambs = kf.run(seg, x0, 0.0, kf.p0, kf.p0_ambient)
         idx = np.arange(len(seg))
         meas = {
             k: np.interp(idx, np.flatnonzero(~np.isnan(seg.y[k])), seg.y[k][~np.isnan(seg.y[k])])

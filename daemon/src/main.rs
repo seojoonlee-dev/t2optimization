@@ -40,6 +40,8 @@ use control::{pkg_from_pc0r, rapl_with_die, Config, Controller, Mode, Reading};
 use model::{Model, Power, IO_IDLE_W, SENSORS, SETPOINT};
 
 const STATUS: &str = "/run/t2opt-fand.json";
+/// extra heat at shutdown, for the next start (tmpfs: kept across restarts, not reboots)
+const HEAT: &str = "/run/t2opt-fand-heat.json";
 const LOCK: &str = "/run/t2opt-fand.lock";
 /// eco | balanced | perf, writable by the wheel group (power-mode, Touch Bar)
 const MODE_DIR: &str = "/run/t2opt-fand";
@@ -276,6 +278,12 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
         hw::set_core_limit(None, 0.0)?;
     }
     ctl.set_mode(setup_mode_file(&cfg)?);
+    if !shadow {
+        ctl.saved_heat = load_heat(&cfg);
+        if let Some(h) = ctl.saved_heat {
+            println!("extra heat {h:+.1} W picked up from the last run");
+        }
+    }
     let mode = if shadow { "shadow" } else { "control" };
     println!(
         "fand {mode}: fans {:.0}-{:.0} rpm (limits {:.0}-{:.0}), ceiling {} °C, model {} ({})",
@@ -356,12 +364,12 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
                             Some(c) => {
                                 let (pl1, pl2) = rapl_limits(&cfg, c.cpu);
                                 let (pl1, pl2) = rapl_with_die(pl1, pl2, ctl.die_cap);
-                                hw::set_cpu_limits(pl1, pl2, cfg.pl1_window_s)?;
+                                hw::set_cpu_limits(pl1, pl2, cfg.pl1_window_s, cfg.pl_step_w)?;
                                 hw::set_core_limit(c.cores, cfg.pl1_window_s)?;
                             }
                             None => {
                                 let (pl1, pl2) = rapl_with_die(cfg.warmup_pl1_w, cfg.warmup_pl1_w + cfg.pl2_extra_w, ctl.die_cap);
-                                hw::set_cpu_limits(pl1, pl2, cfg.pl1_window_s)?;
+                                hw::set_cpu_limits(pl1, pl2, cfg.pl1_window_s, cfg.pl_step_w)?;
                                 hw::set_core_limit(None, 0.0)?;
                             }
                         }
@@ -437,9 +445,22 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
             eprintln!("core limit: {e}");
         }
         println!("fans released to the SMC, core power limit off");
+        let st = serde_json::json!({ "time": now_unix(), "heat_w": ctl.heat(), "model": cfg.model });
+        if let Err(e) = std::fs::write(HEAT, st.to_string()) {
+            eprintln!("{HEAT}: {e}");
+        }
     }
     let _ = std::fs::remove_file(STATUS);
     res
+}
+
+/// Extra heat saved by the last run, if it ran the same model and stopped
+/// no more than heat_keep_s ago: a restart otherwise drops what hours of
+/// load taught it (6-10 W in a long game, 2026-10-28).
+fn load_heat(cfg: &Config) -> Option<f64> {
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(HEAT).ok()?).ok()?;
+    let fresh = now_unix() - v["time"].as_f64()? <= cfg.heat_keep_s;
+    (fresh && v["model"].as_str()? == cfg.model).then(|| v["heat_w"].as_f64()).flatten()
 }
 
 fn now_unix() -> f64 {

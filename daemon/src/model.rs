@@ -24,10 +24,26 @@ pub const N: usize = 6;
 /// (sim/data.py IO_IDLE_W, fit on the extra-logger logs 2026-10-28)
 pub const IO_IDLE_W: f64 = 6.2;
 
-// Kalman noise, as in sim/forecast.py
-const SENSOR_NOISE: f64 = 0.3;
-const PROCESS_NOISE: [f64; N] = [0.05, 0.02, 0.005, 0.05, 0.05, 0.05];
-const AMBIENT_NOISE: f64 = 0.003;
+/// Kalman filter settings: noise per second (K rms) and the uncertainty at a
+/// cold start (K²). A model's "kalman" block overrides these defaults, the
+/// hand-picked values of sim/forecast.py.
+#[derive(Clone, Copy)]
+pub struct KalmanTune {
+    pub sensor: f64,
+    /// H, C, S, M, W, B
+    pub process: [f64; N],
+    pub ambient: f64,
+    pub p0: f64,
+    pub p0_ambient: f64,
+}
+
+const NODE_NAMES: [&str; N] = ["H", "C", "S", "M", "W", "B"];
+
+impl Default for KalmanTune {
+    fn default() -> Self {
+        Self { sensor: 0.3, process: [0.05, 0.02, 0.005, 0.05, 0.05, 0.05], ambient: 0.003, p0: 25.0, p0_ambient: 9.0 }
+    }
+}
 
 pub fn ema_alpha() -> [f64; 5] {
     TS1S_TAU_S.map(|tau| 1.0 - (-1.0 / tau).exp())
@@ -109,6 +125,7 @@ pub struct Model {
     /// true if memory power is an input (rc3m, rc3mwb)
     pub uses_pm: bool,
     pub die: Option<Die>,
+    pub kalman: KalmanTune,
     pub w: Mat<5, N>,
     pub d: [f64; 5],
     cinv: [f64; N],
@@ -163,10 +180,25 @@ impl Model {
                 Some(Die { c0: k("c0")?, k_h: k("k_h")?, k_c: k("k_c")?, k_core: k("k_core")?, k_per_busy: k("k_per_busy")?, per_core_max_w, feedback_tau_s: k("feedback_tau_s")? })
             }
         };
+        let mut kalman = KalmanTune::default();
+        let kv = &v["kalman"];
+        if !kv.is_null() {
+            let k = |n: &str| kv[n].as_f64().ok_or_else(|| format!("{}: missing kalman.{n}", path.display()));
+            kalman.sensor = k("sensor_noise")?;
+            kalman.ambient = k("ambient_noise")?;
+            kalman.p0 = k("p0")?;
+            kalman.p0_ambient = k("p0_ambient")?;
+            for (q, name) in kalman.process.iter_mut().zip(NODE_NAMES) {
+                if let Some(x) = kv["process_noise"][name].as_f64() {
+                    *q = x;
+                }
+            }
+        }
         let mut m = Self {
             topology,
             uses_pm,
             die,
+            kalman,
             w,
             d,
             cinv: [1.0 / p("cap_H")?, 1.0 / p("cap_C")?, 1.0 / p("cap_S")?, 0.0, 0.0, 0.0],
@@ -295,15 +327,16 @@ impl Kalman {
         let h = std::array::from_fn(|i| std::array::from_fn(|j| if j < N { m.w[i][j] } else { 1.0 }));
         let mut q = [[0.0; N + 1]; N + 1];
         let mut p0 = [0.0; N + 1];
+        let t = m.kalman;
         for i in 0..N {
             if m.active(i) {
-                q[i][i] = PROCESS_NOISE[i].powi(2);
-                p0[i] = 25.0;
+                q[i][i] = t.process[i].powi(2);
+                p0[i] = t.p0;
             }
         }
-        q[N][N] = AMBIENT_NOISE.powi(2);
-        p0[N] = 9.0;
-        let r = linalg::scale(&linalg::eye::<5>(), SENSOR_NOISE.powi(2));
+        q[N][N] = t.ambient.powi(2);
+        p0[N] = t.p0_ambient;
+        let r = linalg::scale(&linalg::eye::<5>(), t.sensor.powi(2));
         Self { x: [0.0; N + 1], p: linalg::eye(), h, q, r, p0 }
     }
 

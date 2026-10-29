@@ -172,6 +172,7 @@ class ThermalModel:
         self.out_w = out_w  # sensor -> node weights (array, >= 0)
         self.out_d = out_d  # sensor -> offset (absorbs the ambient of the fit data)
         self.ambient = ambient  # shift for a different ambient than the fit data
+        self.kalman = None  # the model's own Kalman settings (sim/forecast.py), if tuned
 
     def simulate(self, x0, pc, pg, rpm, pm=None, io=None, chg=None):
         fan = fan_feature(rpm, self.params["fan_exp"])
@@ -205,12 +206,14 @@ class ThermalModel:
     @classmethod
     def from_json(cls, text):
         d = json.loads(text)
-        return cls(
+        m = cls(
             TOPOLOGIES[d["topology"]],
             d["params"],
             {k: np.array(v) for k, v in d["out_w"].items()},
             d["out_d"],
         )
+        m.kalman = d.get("kalman")
+        return m
 
 
 def solve_outputs(states_list, y_list, w_list):
