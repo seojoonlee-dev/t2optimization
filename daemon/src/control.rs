@@ -89,15 +89,11 @@ pub struct Config {
     /// eco's hard dGPU cap (power1_cap W, no burst); without it eco's dGPU
     /// got the full thermal cap (Minecraft held ~20-25 W, 2026-10-24)
     pub eco_dgpu_cap_w: f64,
-    /// while eco's energy budget holds the package, the cores alone are
-    /// limited (RAPL PP0) to what they got under it, the package minus
-    /// eco_uncore_w, and the package limit rises by eco_igpu_w, so the extra
-    /// is the iGPU's. Without it the cores took the whole package and the
-    /// iGPU sat at 100-250 MHz asking for 1250 (desktop lag, 2026-10-24)
-    pub eco_igpu_w: f64,
-    /// package power outside the cores at eco's cap with the iGPU idle (ring,
-    /// LLC, system agent; 3.6-3.9 W in the 2026-10-2x fand logs)
-    pub eco_uncore_w: f64,
+    /// eco's CPU cap never goes under this (RAPL PL1 W), however far its
+    /// energy budget drains: with every thread busy at the lowest clock the
+    /// cores (~6.3 W) and the rest of the package (~3.5 W) already overran
+    /// 8 or 10 W and the iGPU sat at 100 MHz asking for 1250 (2026-10-29)
+    pub eco_pl1_min_w: f64,
     /// CPU package limit range (RAPL PL1, W); the low end keeps the iGPU,
     /// which shares the package budget, from starving (9 W stuttered video)
     pub cpu_pl1_min_w: f64,
@@ -205,9 +201,6 @@ pub struct Caps {
     pub cpu: f64,
     /// None while the dGPU sleeps (it draws nothing to cap)
     pub gpu: Option<f64>,
-    /// cores-only limit (RAPL PP0, W), set while eco's energy budget holds
-    /// the package so the iGPU keeps its share; None = off
-    pub cores: Option<f64>,
 }
 
 /// The CPU limits in RAPL terms (W), with the hottest-core limit on PL2
@@ -253,8 +246,7 @@ impl Default for Config {
             eco_sustained_w: 8.0,
             eco_burst_s: 30.0,
             eco_dgpu_cap_w: 10.0,
-            eco_igpu_w: 6.0,
-            eco_uncore_w: 4.0,
+            eco_pl1_min_w: 14.0,
             cpu_pl1_min_w: 12.0,
             cpu_pl1_max_w: 45.0,
             pl2_extra_w: 5.0,
@@ -346,7 +338,7 @@ pub struct Reading {
 fn split(cfg: &Config, total: f64, demand: Power, dgpu_active: bool) -> Caps {
     let (cmin, cmax) = cfg.cpu_range();
     if !dgpu_active {
-        return Caps { cpu: total.clamp(cmin, cmax), gpu: None, cores: None };
+        return Caps { cpu: total.clamp(cmin, cmax), gpu: None };
     }
     let (dc, dg) = (demand.pc.max(0.0), demand.pg.max(0.0));
     let (c, g) = if total >= dc + dg {
@@ -356,7 +348,7 @@ fn split(cfg: &Config, total: f64, demand: Power, dgpu_active: bool) -> Caps {
         let k = total / (dc + dg).max(1e-9);
         (dc * k, dg * k)
     };
-    Caps { cpu: c.clamp(cmin, cmax), gpu: Some(g.clamp(cfg.dgpu_cap_min_w, cfg.dgpu_cap_max_w)), cores: None }
+    Caps { cpu: c.clamp(cmin, cmax), gpu: Some(g.clamp(cfg.dgpu_cap_min_w, cfg.dgpu_cap_max_w)) }
 }
 
 struct Planner {
@@ -634,26 +626,20 @@ impl Controller {
 
     /// Switch power mode; the next tick plans for it at once.
     /// eco's CPU cap from its energy budget (PC0R W): the full PL1 range with
-    /// a full budget, sliding to eco_sustained_w as it drains; None outside eco.
+    /// a full budget, sliding to eco_sustained_w as it drains but never under
+    /// eco_pl1_min_w; None outside eco.
     fn energy_cap(&self) -> Option<f64> {
         let cfg = &self.cfg;
         (self.mode == Mode::Eco).then(|| {
             let room = cfg.cpu_pl1_max_w - cfg.eco_sustained_w;
-            pc0r_from_pkg(cfg.eco_sustained_w + room * self.energy_j / (room * cfg.eco_burst_s))
+            let w = cfg.eco_sustained_w + room * self.energy_j / (room * cfg.eco_burst_s);
+            pc0r_from_pkg(w.max(cfg.eco_pl1_min_w))
         })
     }
 
     /// eco's hard dGPU cap (W); None outside eco.
     fn eco_gpu_cap(&self) -> Option<f64> {
         (self.mode == Mode::Eco).then_some(self.cfg.eco_dgpu_cap_w)
-    }
-
-    /// The package cap (PC0R W) and cores limit (RAPL W) while eco's energy
-    /// cap `e` (PC0R W) holds: the cores keep what they got under `e`, the
-    /// iGPU gets eco_igpu_w on top.
-    fn igpu_fence(&self, e: f64) -> (f64, f64) {
-        let pkg = pkg_from_pc0r(e);
-        (pc0r_from_pkg(pkg + self.cfg.eco_igpu_w), (pkg - self.cfg.eco_uncore_w).max(1.0))
     }
 
     /// Extra heat the integral action has found (W).
@@ -705,7 +691,6 @@ impl Controller {
                 (Some(p), Some(w)) => Some(step(p, w, from.and_then(|f| f.gpu))),
                 (_, w) => w,
             },
-            cores: None,
         }
     }
 
@@ -808,7 +793,7 @@ impl Controller {
             self.plan_want = Some(want);
             let caps = self.stepped(want, r.ts1s > cfg.ceiling_c);
             // the fans plan for the power the caps (and eco's energy budget) let through
-            let eco_pc = self.energy_cap().map_or(f64::INFINITY, |e| self.igpu_fence(e).0);
+            let eco_pc = self.energy_cap().unwrap_or(f64::INFINITY);
             let eco_pg = self.eco_gpu_cap().unwrap_or(f64::INFINITY);
             let p = Power { pc: demand.pc.min(caps.cpu).min(eco_pc), pg: caps.gpu.map_or(demand.pg, |g| demand.pg.min(g).min(eco_pg)), ..demand };
             (self.plan_rpm, self.pred, self.plan_reason) =
@@ -829,10 +814,7 @@ impl Controller {
         let eco_gpu = self.eco_gpu_cap();
         let target = self.plan_caps.map(|plan| {
             let c = match energy {
-                Some(e) if e < plan.cpu => {
-                    let (cpu, cores) = self.igpu_fence(e);
-                    Caps { cpu: cpu.min(plan.cpu), cores: Some(cores), ..plan }
-                }
+                Some(e) if e < plan.cpu => Caps { cpu: e, ..plan },
                 _ => plan,
             };
             Caps { gpu: c.gpu.map(|g| eco_gpu.map_or(g, |e| g.min(e))), ..c }
@@ -848,12 +830,11 @@ impl Controller {
                     (Some(a), Some(b)) => Some(mid(a, b)),
                     (_, g) => g,
                 };
-                // eco's iGPU fence only once the package cap is down to it
-                Some(Caps { cpu, gpu, cores: t.cores.filter(|_| cpu <= t.cpu + 0.01) })
+                Some(Caps { cpu, gpu })
             }
             (t, _) => t,
         };
-        let cpu_held = energy.is_some_and(|e| self.caps.is_some_and(|c| c.cores.is_some()) && r.p.pc >= e - 1.0);
+        let cpu_held = energy.is_some_and(|e| self.caps.is_some_and(|c| c.cpu >= e - 0.01) && r.p.pc >= e - 1.0);
         let gpu_held = eco_gpu.is_some_and(|e| self.caps.and_then(|c| c.gpu).is_some_and(|g| g >= e - 0.01) && r.p.pg >= e - 1.0);
         if cpu_held || gpu_held {
             self.plan_reason = "energy-cap";
@@ -891,7 +872,7 @@ impl Controller {
         }
         if r.pz0t > 0.0 || r.ts1s > SETPOINT + cfg.cut_over_setpoint_c {
             let (cmin, _) = cfg.cpu_range();
-            self.caps = Some(Caps { cpu: cmin, gpu: r.dgpu_active.then_some(cfg.dgpu_cap_min_w), cores: None });
+            self.caps = Some(Caps { cpu: cmin, gpu: r.dgpu_active.then_some(cfg.dgpu_cap_min_w) });
         }
         for (f, why) in floors {
             if f > target {

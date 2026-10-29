@@ -61,13 +61,12 @@ eco_burst_s = 30.0
 # read ~1.5-2.5 W above the cap in a short 2026-10-25 log
 eco_dgpu_cap_w = 10.0
 
-# while that budget holds the package, the cores are fenced (RAPL PP0) at the
-# package minus eco_uncore_w and the package limit rises by eco_igpu_w for the
-# iGPU only: capped at 8 W the cores took everything and the iGPU sat at
-# 100-250 MHz (desktop lag, 2026-10-24). 6 W ~ the iGPU's p90 at 500-1300 MHz
-# in the 2026-10-19 logs; 4 W ~ the non-core package power at the cap
-eco_igpu_w = 6.0
-eco_uncore_w = 4.0
+# however far that budget drains, eco's PL1 stays at least this (RAPL W).
+# Capped at 8 W the iGPU sat at 100-250 MHz (desktop lag, 2026-10-24): with
+# every thread busy at the lowest clock the cores (~6.3 W) and the rest of the
+# package (~3.5 W) already overrun 8-10 W (2026-10-29 tests). 14 W = what the
+# old iGPU fence gave (8 + 6); its cores-only limit (RAPL PP0) did nothing
+eco_pl1_min_w = 14.0
 
 # fans never go below / above these (mean of the two fans, rpm);
 # the SMC's own range is ~2080-5708

@@ -313,24 +313,12 @@ const RAPL_CORE: &str = "/sys/class/powercap/intel-rapl:0:0";
 /// the "uncore" domain (PP1) is the iGPU
 const RAPL_GFX: &str = "/sys/class/powercap/intel-rapl:0:1";
 
-/// Cores-only limit (RAPL PP0): eco's iGPU fence while its energy budget
-/// holds the package. None switches it off (also at start and exit).
-pub fn set_core_limit(w: Option<f64>, window_s: f64) -> Result<(), String> {
-    let enabled = rd(&format!("{RAPL_CORE}/enabled")).is_ok_and(|v| v == "1");
-    let Some(w) = w else {
-        if enabled {
-            wr(&format!("{RAPL_CORE}/enabled"), 0)?;
-        }
-        return Ok(());
-    };
-    let uw = (w * 1e6).round() as u64;
-    let cur = rd(&format!("{RAPL_CORE}/constraint_0_power_limit_uw")).ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
-    if cur.abs_diff(uw) >= 250_000 {
-        wr(&format!("{RAPL_CORE}/constraint_0_power_limit_uw"), uw)?;
-        let _ = wr(&format!("{RAPL_CORE}/constraint_0_time_window_us"), (window_s * 1e6).round() as u64);
-    }
-    if !enabled {
-        wr(&format!("{RAPL_CORE}/enabled"), 1)?;
+/// Switches the cores-only limit (RAPL PP0) off. It does nothing on this
+/// CPU (4 W set, two threads drew 41-43 W in the cores, 2026-10-29), but an
+/// older build or a test may have left it on.
+pub fn core_limit_off() -> Result<(), String> {
+    if rd(&format!("{RAPL_CORE}/enabled")).is_ok_and(|v| v == "1") {
+        wr(&format!("{RAPL_CORE}/enabled"), 0)?;
     }
     Ok(())
 }

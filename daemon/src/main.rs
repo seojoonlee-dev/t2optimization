@@ -127,8 +127,8 @@ fn read_mode() -> Option<Mode> {
 
 /// What the CPU cap means in RAPL terms: (PL1, PL2) in W.
 fn rapl_limits(cfg: &Config, cpu_cap_pc0r: f64) -> (f64, f64) {
-    // eco's energy budget may go under the thermal plan's floor
-    let pl1 = pkg_from_pc0r(cpu_cap_pc0r).clamp(cfg.cpu_pl1_min_w.min(cfg.eco_sustained_w), cfg.cpu_pl1_max_w);
+    // eco's own floor may be under the thermal plan's
+    let pl1 = pkg_from_pc0r(cpu_cap_pc0r).clamp(cfg.cpu_pl1_min_w.min(cfg.eco_pl1_min_w), cfg.cpu_pl1_max_w);
     (pl1, pl1 + cfg.pl2_extra_w)
 }
 
@@ -188,7 +188,7 @@ fn write_status(mode: &str, ctl: &Controller, r: &Reading) {
 }
 
 const CSV_HEAD: &str = "timestamp,unix_time,mode,cmd_rpm,reason,pred_ts1s_max,kf_ambient,kf_H,kf_C,kf_S,replica_bias,power_mode,fan_ceiling,\
-cpu_pl1_w,cpu_cores_w,dgpu_cap_w,dgpu_active,heat_w,sustainable_w,rapl_pkg_w,rapl_core_w,rapl_gfx_w,igpu_act_mhz,igpu_req_mhz,cpu_busy_pct,cpu_iowait_pct,wifi_mb_s,cpu_core_c";
+cpu_pl1_w,dgpu_cap_w,dgpu_active,heat_w,sustainable_w,rapl_pkg_w,rapl_core_w,rapl_gfx_w,igpu_act_mhz,igpu_req_mhz,cpu_busy_pct,cpu_iowait_pct,wifi_mb_s,cpu_core_c";
 
 /// Extra per-second measurements for the CSV (live only).
 #[derive(Default)]
@@ -216,11 +216,10 @@ fn csv_row(mode: &str, ctl: &Controller, vals: &[Option<f64>], unix: f64, dgpu_a
     );
     let opt = |v: Option<f64>| v.map_or(String::new(), |v| format!("{v:.1}"));
     row.push_str(&format!(
-        ",{},{:.0},{},{},{},{},{:.2},{:.2}",
+        ",{},{:.0},{},{},{},{:.2},{:.2}",
         ctl.mode.name(),
         ctl.cfg.fan_ceiling(ctl.mode).min(ctl.hi),
         opt(ctl.caps.map(|c| rapl_limits(&ctl.cfg, c.cpu).0)),
-        opt(ctl.caps.and_then(|c| c.cores)),
         opt(ctl.caps.and_then(|c| c.gpu)),
         u8::from(dgpu_active),
         ctl.heat(),
@@ -273,9 +272,9 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
     let smc = hw::SmcReader::open(&all, &optional)?;
     // amdgpu can register its card after fand starts at boot, so a miss is retried each tick
     let mut dgpu = hw::Dgpu::find();
-    // an earlier build could leave the cores-only power limit on
+    // an earlier build (or a test) could leave the cores-only power limit on
     if !shadow {
-        hw::set_core_limit(None, 0.0)?;
+        hw::core_limit_off()?;
     }
     ctl.set_mode(setup_mode_file(&cfg)?);
     if !shadow {
@@ -368,13 +367,11 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
                                 let (pl1, pl2) = rapl_limits(&cfg, c.cpu);
                                 let (pl1, pl2) = rapl_with_die(pl1, pl2, ctl.die_cap);
                                 let wrote = hw::set_cpu_limits(pl1, pl2, cfg.pl1_window_s, cfg.pl_step_w)?;
-                                hw::set_core_limit(c.cores, cfg.pl1_window_s)?;
                                 wrote
                             }
                             None => {
                                 let (pl1, pl2) = rapl_with_die(cfg.warmup_pl1_w, cfg.warmup_pl1_w + cfg.pl2_extra_w, ctl.die_cap);
                                 let wrote = hw::set_cpu_limits(pl1, pl2, cfg.pl1_window_s, cfg.pl_step_w)?;
-                                hw::set_core_limit(None, 0.0)?;
                                 wrote
                             }
                         };
@@ -418,10 +415,9 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
                     if ctl.reason != last.0 || ctl.mode != last.1 {
                         let caps = ctl.caps.map_or("caps not set yet".to_owned(), |c| {
                             let (pl1, _) = rapl_limits(&cfg, c.cpu);
-                            let cores = c.cores.map_or(String::new(), |w| format!(" (cores {w:.1} W)"));
                             match c.gpu {
-                                Some(g) => format!("PL1 {pl1:.1} W{cores}, dGPU {g:.1} W"),
-                                None => format!("PL1 {pl1:.1} W{cores}"),
+                                Some(g) => format!("PL1 {pl1:.1} W, dGPU {g:.1} W"),
+                                None => format!("PL1 {pl1:.1} W"),
                             }
                         });
                         println!(
@@ -454,7 +450,7 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
     })();
     if !shadow {
         fans.release();
-        if let Err(e) = hw::set_core_limit(None, 0.0) {
+        if let Err(e) = hw::core_limit_off() {
             eprintln!("core limit: {e}");
         }
         if let Err(e) = clamp.restore() {
@@ -626,7 +622,7 @@ fn main() {
                     None => eprintln!("dGPU cap: no power1_cap_default"),
                 }
             }
-            if let Err(e) = hw::set_core_limit(None, 0.0) {
+            if let Err(e) = hw::core_limit_off() {
                 eprintln!("core limit: {e}");
             }
             hw::Fans::open().map(|f| f.release())
