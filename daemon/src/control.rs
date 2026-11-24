@@ -23,9 +23,6 @@ use crate::model::{self, Kalman, Model, Power, Replica, FAN_TAU_S, SETPOINT};
 pub struct Config {
     /// model JSON, relative to the config file's directory
     pub model: String,
-    /// where the 1 Hz CSV logs go, relative to the config file's directory
-    pub log_dir: String,
-    pub log_csv: bool,
     /// Ts1S the plan must stay under; the SMC budget's set point is 44.989.
     /// Fans plan for it, and the power caps settle Ts1S there
     pub ceiling_c: f64,
@@ -216,8 +213,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             model: "../models/rc3-v1.json".into(),
-            log_dir: "../data".into(),
-            log_csv: true,
             ceiling_c: 44.6,
             zone_max_w: 64.0,
             sustain_horizon_s: 600,

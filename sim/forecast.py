@@ -139,7 +139,7 @@ def main(name):
             elif seg.source.startswith("fand-"):
                 split = "fand-val"
             else:
-                split = "val" if seg.source == "session" else "night-test"
+                split = "night-test"
             for h in HORIZONS:
                 end = t + h
                 if end >= len(seg) or end not in sampled_set or any(t < r <= end for r in resets):

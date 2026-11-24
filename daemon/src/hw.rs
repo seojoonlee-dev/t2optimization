@@ -363,19 +363,6 @@ pub fn core_temps() -> Option<(f64, f64)> {
     (n > 0).then(|| (sum / n as f64, max))
 }
 
-/// The iGPU's actual and requested clock (MHz), for logging.
-pub fn igpu_mhz() -> Option<(f64, f64)> {
-    let cards = std::fs::read_dir("/sys/class/drm").ok()?;
-    for c in cards.flatten() {
-        let gt = c.path().join("gt/gt0");
-        if gt.join("rps_act_freq_mhz").exists() {
-            let f = |n: &str| std::fs::read_to_string(gt.join(n)).ok()?.trim().parse::<f64>().ok();
-            return Some((f("rps_act_freq_mhz")?, f("rps_cur_freq_mhz")?));
-        }
-    }
-    None
-}
-
 /// Keeps scx_lavd's profile in step with the power mode through scx_loader's
 /// D-Bus API (busctl, root may call it). Only touches a running scx_lavd: no
 /// scx_loader, another scheduler or none at all means nothing to do. Checked
@@ -452,28 +439,5 @@ impl CpuMeter {
         let dt = total.checked_sub(prev.0).filter(|&d| d > 0)? as f64;
         let busy = dt - (idle - prev.1.min(idle)) as f64 - (iowait - prev.2.min(iowait)) as f64;
         Some((100.0 * busy / dt, 100.0 * (iowait - prev.2.min(iowait)) as f64 / dt))
-    }
-}
-
-/// Wi-Fi traffic (MB/s, received + sent) on the first wireless interface:
-/// a long download heats the Wi-Fi module, which the model has no input for.
-pub struct WifiMeter {
-    dev: Option<std::path::PathBuf>,
-    last: Option<(u64, std::time::Instant)>,
-}
-
-impl WifiMeter {
-    pub fn new() -> Self {
-        let dev = std::fs::read_dir("/sys/class/net").ok().and_then(|d| d.flatten().map(|e| e.path()).find(|p| p.join("wireless").exists()));
-        Self { dev, last: None }
-    }
-
-    pub fn read(&mut self) -> Option<f64> {
-        let dev = self.dev.as_ref()?;
-        let n = |f: &str| std::fs::read_to_string(dev.join("statistics").join(f)).ok()?.trim().parse::<u64>().ok();
-        let now = (n("rx_bytes")? + n("tx_bytes")?, std::time::Instant::now());
-        let prev = self.last.replace(now)?;
-        let dt = now.1.duration_since(prev.1).as_secs_f64();
-        (dt > 0.2 && now.0 >= prev.0).then(|| (now.0 - prev.0) as f64 / dt / 1e6)
     }
 }

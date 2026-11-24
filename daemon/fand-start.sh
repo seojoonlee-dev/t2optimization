@@ -3,7 +3,7 @@
 # takes over again as before).
 #
 #   sudo daemon/fand-start.sh            control the fans
-#   sudo daemon/fand-start.sh --shadow   plan and log only
+#   sudo daemon/fand-start.sh --shadow   plan only (no fans, no power limits)
 #   sudo systemctl stop t2opt-fand              stop
 #   journalctl -fu t2opt-fand                   watch decisions
 #   cat /run/t2opt-fand.json                    current state

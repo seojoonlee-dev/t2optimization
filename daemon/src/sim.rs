@@ -20,7 +20,7 @@ use std::path::Path;
 
 use crate::control::{pc0r_from_pkg, pkg_from_pc0r, Config, Controller, Mode, Reading};
 use crate::model::{self, Kalman, Model, Power, FAN_TAU_S, SETPOINT};
-use crate::{rapl_limits, reading, KEYS};
+use crate::{rapl_limits, reading, INPUT_KEYS, KEYS};
 
 /// Die above heatsink per W of CPU power over 2-5 s: 0.25-0.45 K/W in the
 /// 10-19 stress test and two 10-20 fand logs; the top end, so capped runs
@@ -89,7 +89,7 @@ pub fn run_sim(cfg: Config, cfg_dir: &Path, path: &Path, a: SimArgs) -> Result<(
     let mut lines = BufReader::new(f).lines().map_while(Result::ok);
     let head: Vec<String> = lines.next().ok_or("empty CSV")?.split(',').map(str::to_owned).collect();
     let col = |n: &str| head.iter().position(|h| h == n);
-    let cols: Vec<Option<usize>> = KEYS.iter().map(|k| col(k)).collect();
+    let cols: Vec<Option<usize>> = KEYS.iter().chain(&INPUT_KEYS).map(|k| col(k)).collect();
     let ts_col = col("timestamp").ok_or("no timestamp column")?;
     let rows: Vec<Vec<String>> = lines.map(|l| l.split(',').map(str::to_owned).collect()).collect();
     let num = |row: &Vec<String>, n: &str| col(n).and_then(|i| row.get(i)?.parse::<f64>().ok());
@@ -189,7 +189,7 @@ pub fn run_sim(cfg: Config, cfg_dir: &Path, path: &Path, a: SimArgs) -> Result<(
         let (pz0e, pz0t) = lim.step(ts1s, last_p.pc + last_p.pg);
         let dh = if a.inject { x[0] - shadow[0] } else { 0.0 };
         let die = |t: Option<f64>| t.map(|t| t + dh + DIE_K_PER_W * (last_p.pc - r.p.pc));
-        let sr = Reading { y, ts1s, pz0t, p: *last_p, rpm: *rpm, tcmx: die(r.tcmx), cores_c: die(num(row, "cpu_core_c")), tgdd: r.tgdd, dgpu_active: want.pg > 1.0, core_max: None, pkg_w: None, core_w: None, busy: None };
+        let sr = Reading { y, ts1s, pz0t, p: *last_p, rpm: *rpm, tcmx: die(r.tcmx), cores_c: die(num(row, "core_mean_c").or_else(|| num(row, "cpu_core_c"))), tgdd: r.tgdd, dgpu_active: want.pg > 1.0, core_max: None, pkg_w: None, core_w: None, busy: None };
         let cmd = ctl.tick(&sr);
         let pl1 = ctl.caps.map_or(ctl.cfg.warmup_pl1_w, |c| rapl_limits(&ctl.cfg, c.cpu).0);
         let gcap = ctl.caps.and_then(|c| c.gpu);

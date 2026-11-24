@@ -15,23 +15,14 @@ import pandas as pd
 from . import smc
 
 DATA = Path(__file__).resolve().parent.parent / "data"
-STRESS_CSV = DATA / "ts1s-stress-2026-10-19.csv"
-SESSION_CSV = DATA / "igpu-clamp-session-2026-10-19.csv"
-
-# PC0R (CPU rail at VR input) from RAPL package watts, fitted on the 1 Hz
-# stress log (rms 1.3 W). The session log has RAPL every 2 s but PC0R only
-# every 10 s, so the finer RAPL series makes the better input there.
-PC0R_FROM_PKG = (1.2648, 0.8040)
-
 OUTPUTS = smc.SENSORS + ["Ts1S", "PZ0E", "PZ0F", "PZ0T"]
 
-# held-out validation: everything in the session log from here on
-VALIDATION_START = pd.Timestamp("2026-10-19 19:45:00")
 # long passive logs (the overnight run) train on all but their last part
 LONG_LOG_S = 3 * 3600
 LONG_LOG_HOLDOUT_S = 5400
-# fand logs join the fit, all but their last part (fand runs near the throttle
-# at mid-to-high fan speeds, where the other logs have little data)
+# extra-logger (and older fand) logs join the fit, all but their last part
+# (they cover the throttle region at mid-to-high fan speeds, where the other
+# logs have little data)
 FAND_HOLDOUT_FRAC = 0.3
 # I/O power (POLR + PORR + PSLC: Wi-Fi + SSD path rails) where a log lacks
 # those keys: from wifi_mb_s where fand logged it (fit on the extra-logger
@@ -112,11 +103,18 @@ def _io_chg(part, sec, grid, prefix=""):
 _EXTRA = None
 
 
+def _full_extra(path):
+    """An extra-logger CSV with every key the fit needs (fand no longer logs).
+    Older extra logs only had the other rails and are joined to fand's logs."""
+    with open(path) as f:
+        return "Ts1S" in f.readline().strip().split(",")
+
+
 def _extra():
-    """All extra-logger CSVs (tools/extra-logger.py), joined to fand logs on unix_time."""
+    """Older extra-logger CSVs (tools/extra-logger.py), joined to fand's old logs on unix_time."""
     global _EXTRA
     if _EXTRA is None:
-        files = sorted(DATA.glob("extra-*.csv"))
+        files = [p for p in sorted(DATA.glob("extra-*.csv")) if not _full_extra(p)]
         if files:
             ex = pd.concat([pd.read_csv(p, on_bad_lines="skip") for p in files])
             _EXTRA = ex.dropna(subset=["unix_time"]).drop(columns=["timestamp"]).sort_values("unix_time")
@@ -125,71 +123,8 @@ def _extra():
     return _EXTRA
 
 
-def load_stress():
-    df = pd.read_csv(STRESS_CSV)
-    # local wall clock of the first row + sub-second-accurate unix offsets
-    t0 = pd.Timestamp(df["timestamp"].iloc[0])
-    ts = t0 + pd.to_timedelta(df["unix_time"] - df["unix_time"].iloc[0], unit="s")
-    n = int((ts.iloc[-1] - t0).total_seconds()) + 1
-    sec, grid = _grid(ts, t0, n)
-    seg = Segment(
-        name="stress",
-        source="stress",
-        t0=t0,
-        pc=_interp(sec, df["PC0R"], grid),
-        pg=_interp(sec, df["PG0R"], grid),
-        rpm=_interp(sec, (df["F0Ac"] + df["F1Ac"]) / 2, grid),
-        y={k: _place(sec, df[k], n) for k in OUTPUTS},
-        pm=_interp(sec, df["PM0C"], grid),
-    )
-    seg.io, seg.chg, seg.io_measured = _io_chg(df, sec, grid)
-    return [seg]
-
-
-def load_session():
-    df = pd.read_csv(SESSION_CSV, parse_dates=["timestamp"])
-    gap = df["timestamp"].diff().dt.total_seconds().fillna(0)
-    # >5 min gap = long suspend: new segment, unknown thermal state.
-    # Short gaps (the 10 s suspend at 19:42) keep the thermal state but reset the SMC.
-    seg_id = (gap > 300).cumsum()
-    segs = []
-    for k, part in df.groupby(seg_id):
-        ts = part["timestamp"]
-        t0 = ts.iloc[0]
-        n = int((ts.iloc[-1] - t0).total_seconds()) + 1
-        sec, grid = _grid(ts, t0, n)
-        a, b = PC0R_FROM_PKG
-        # RAPL watts are energy deltas: the first sample after a gap spans the
-        # suspend and reads hundreds of W
-        pkg = part["pkg_w"].where(gap.loc[part.index] <= 3)
-        y = {}
-        for name in OUTPUTS:
-            y[name] = _place(sec, part["smc_" + name], n)
-        resets = [int(round(s)) for s, g in zip(sec, gap.loc[part.index]) if 8 <= g <= 300]
-        seg = Segment(
-            name=f"session{k}",
-            source="session",
-            step=10.0,
-            t0=t0,
-            pc=_interp(sec, a * pkg + b, grid),
-            pg=_interp(sec, part["smc_PG0R"], grid),
-            rpm=_interp(sec, (part["fan1_rpm"] + part["fan2_rpm"]) / 2, grid),
-            pm=_interp(sec, part["smc_PM0C"], grid),
-            y=y,
-            smc_resets=resets,
-        )
-        seg.io, seg.chg, seg.io_measured = _io_chg(part, sec, grid, "smc_")
-        cut = int((VALIDATION_START - t0).total_seconds())
-        if 0 < cut < n:
-            seg.val_from = cut
-        elif cut <= 0:
-            seg.val_from = 0
-        segs.append(seg)
-    return segs
-
-
 def load_passive(path):
-    """A tools/logger.py or fand run: 1 Hz, all held out as fresh test data."""
+    """A 1 Hz log (extra logger, or an older fand / passive logger run)."""
     # a running fand may be mid-way through its last line
     df = pd.read_csv(path, on_bad_lines="skip").dropna(subset=["unix_time"])
     ex = _extra()
@@ -229,19 +164,21 @@ def load_passive(path):
 
 
 def load_all(test=True):
-    """Fit segments (+ the short passive logs as pure test segments if `test`).
+    """Fit segments from every log in data/ (+ the short passive logs as pure
+    test segments if `test`).
 
     Long passive logs join the fit, with their last LONG_LOG_HOLDOUT_S held out
     (that part is scored as test, never fitted).
     """
-    segs = load_stress() + load_session()
-    # fand logs (daemon/) have the same columns as the passive logger's
-    for path in sorted(DATA.glob("passive-*.csv")) + sorted(DATA.glob("fand-*.csv")):
+    segs = []
+    # extra-logger logs, plus older fand and passive-logger logs (same key columns)
+    full = [p for p in sorted(DATA.glob("extra-*.csv")) if _full_extra(p)]
+    for path in sorted(DATA.glob("passive-*.csv")) + sorted(DATA.glob("fand-*.csv")) + full:
         for seg in load_passive(path):
             if seg.source in TEST_ONLY:
                 if test:
                     segs.append(seg)
-            elif seg.source.startswith("fand-"):
+            elif seg.source.startswith(("fand-", "extra-")):
                 seg.val_from = int(len(seg) * (1 - FAND_HOLDOUT_FRAC))
                 segs.append(seg)
             elif len(seg) >= LONG_LOG_S:

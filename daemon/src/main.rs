@@ -12,9 +12,9 @@
 //! their limits, a measured Ts1S above the set point (the model was wrong), and
 //! any SMC throttle (PZ0T > 0) all raise the fans regardless of the plan.
 //!
-//! This is the only process that may read SMC keys while it runs, so
-//! tools/logger.py must not run at the same time; fand logs the same kind of
-//! 1 Hz CSV itself.
+//! fand writes no CSV: all logging is tools/extra-logger.py's job (it reads
+//! the SMC under the same lock and records fand's state from the status
+//! file). --replay and --sim run on its logs, and on fand's older logs.
 //!
 //!     sudo daemon/fand-start.sh [--shadow]              (see that script)
 //!     t2opt-fand --replay data/x.csv [--trace]          offline, no root, no fans
@@ -29,7 +29,7 @@ mod sim;
 mod synth;
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, LineWriter, Write};
+use std::io::{BufRead, BufReader};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,15 +49,15 @@ const MODE_FILE: &str = "/run/t2opt-fand/mode";
 /// the dGPU must stay awake this long before its cap and DPM files are touched
 const DGPU_SETTLE_S: u64 = 15;
 
-/// Logged SMC keys, in CSV column order. TGDD (dGPU die) and PM0C (memory
-/// power, logged for model training only) may be missing.
+/// SMC keys the controller reads every second (and --replay / --sim look up
+/// in a log). TGDD (dGPU die) and PM0C (memory power) may be missing.
 const KEYS: [&str; 16] = [
     "TW0P", "TM0P", "Ts0P", "TG0P", "Ts1P", "Ts1S", "PZ0E", "PZ0F", "PZ0T", "PC0R", "PG0R", "F0Ac", "F1Ac", "TCMX", "TGDD",
     "PM0C",
 ];
 const OPTIONAL: [&str; 2] = ["TGDD", "PM0C"];
 /// Read every second for the model (I/O = POLR + PORR + PSLC, charging =
-/// PDTR - PSTR) but not logged: logging is t2opt-extralog's job
+/// PDTR - PSTR)
 const INPUT_KEYS: [&str; 5] = ["POLR", "PORR", "PSLC", "PDTR", "PSTR"];
 
 fn key(vals: &[Option<f64>], name: &str) -> Option<f64> {
@@ -132,19 +132,6 @@ fn rapl_limits(cfg: &Config, cpu_cap_pc0r: f64) -> (f64, f64) {
     (pl1, pl1 + cfg.pl2_extra_w)
 }
 
-/// Like printf's %.4g, for the CSV.
-fn g4(v: f64) -> String {
-    if v == 0.0 || !v.is_finite() {
-        return format!("{v}");
-    }
-    let exp = v.abs().log10().floor() as i32;
-    if !(-4..4).contains(&exp) {
-        return format!("{v:.3e}");
-    }
-    let s = format!("{v:.*}", (3 - exp).max(0) as usize);
-    if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_owned() } else { s }
-}
-
 fn local_time(unix: i64, fmt: &str) -> String {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     let mut buf = [0u8; 64];
@@ -185,59 +172,6 @@ fn write_status(mode: &str, ctl: &Controller, r: &Reading) {
     if std::fs::write(&tmp, st.to_string()).is_ok() {
         let _ = std::fs::rename(&tmp, STATUS);
     }
-}
-
-const CSV_HEAD: &str = "timestamp,unix_time,mode,cmd_rpm,reason,pred_ts1s_max,kf_ambient,kf_H,kf_C,kf_S,replica_bias,power_mode,fan_ceiling,\
-cpu_pl1_w,dgpu_cap_w,dgpu_active,heat_w,sustainable_w,rapl_pkg_w,rapl_core_w,rapl_gfx_w,igpu_act_mhz,igpu_req_mhz,cpu_busy_pct,cpu_iowait_pct,wifi_mb_s,cpu_core_c";
-
-/// Extra per-second measurements for the CSV (live only).
-#[derive(Default)]
-struct Extra {
-    rapl: Option<[f64; 3]>,
-    igpu: Option<(f64, f64)>,
-    cpu: Option<(f64, f64)>,
-    wifi: Option<f64>,
-    cores_c: Option<f64>,
-}
-
-fn csv_row(mode: &str, ctl: &Controller, vals: &[Option<f64>], unix: f64, dgpu_active: bool, x: &Extra) -> String {
-    let n = ctl.kf.nodes();
-    let mut row = format!(
-        "{},{unix:.1},{mode},{:.0},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3}",
-        local_time(unix as i64, "%F %T"),
-        ctl.cmd,
-        ctl.reason,
-        ctl.pred,
-        ctl.kf.ambient(),
-        n[0],
-        n[1],
-        n[2],
-        ctl.rep.bias
-    );
-    let opt = |v: Option<f64>| v.map_or(String::new(), |v| format!("{v:.1}"));
-    row.push_str(&format!(
-        ",{},{:.0},{},{},{},{:.2},{:.2}",
-        ctl.mode.name(),
-        ctl.cfg.fan_ceiling(ctl.mode).min(ctl.hi),
-        opt(ctl.caps.map(|c| rapl_limits(&ctl.cfg, c.cpu).0)),
-        opt(ctl.caps.and_then(|c| c.gpu)),
-        u8::from(dgpu_active),
-        ctl.heat(),
-        ctl.sustainable
-    ));
-    let pair = |v: Option<(f64, f64)>| v.map_or(",".to_owned(), |(a, b)| format!("{a:.2},{b:.2}"));
-    let wifi = x.wifi.map_or(String::new(), |w| format!("{w:.3}"));
-    let rapl = x.rapl.map_or(",,".to_owned(), |[p, c, g]| format!("{p:.2},{c:.2},{g:.2}"));
-    row.push_str(&format!(",{rapl},{},{},{wifi},{}", pair(x.igpu), pair(x.cpu), opt(x.cores_c)));
-    // the model's extra inputs (INPUT_KEYS) aren't logged
-    for v in vals.iter().take(KEYS.len()) {
-        row.push(',');
-        if let Some(v) = v {
-            row.push_str(&g4(*v));
-        }
-    }
-    row.push('\n');
-    row
 }
 
 fn logger_running() -> bool {
@@ -289,21 +223,6 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
         fans.lo, fans.hi, ctl.lo, ctl.hi, cfg.ceiling_c, cfg.model, ctl.model.topology
     );
 
-    let mut out = None;
-    if cfg.log_csv {
-        let path = cfg_dir.join(&cfg.log_dir).join(local_time(now_unix() as i64, &format!("fand-{mode}-%Y%m%d-%H%M%S.csv")));
-        let f = File::create(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-        // logs belong to whoever owns the config (the checkout's user)
-        if let Ok(m) = std::fs::metadata(cfg_dir) {
-            use std::os::unix::fs::MetadataExt;
-            let _ = std::os::unix::fs::chown(&path, Some(m.uid()), Some(m.gid()));
-        }
-        let mut w = LineWriter::new(f);
-        let _ = writeln!(w, "{CSV_HEAD},{}", KEYS.join(","));
-        println!("log: {}", path.display());
-        out = Some(w);
-    }
-
     let stop = Arc::new(AtomicBool::new(false));
     for sig in [signal_hook::consts::SIGTERM, signal_hook::consts::SIGINT] {
         signal_hook::flag::register(sig, stop.clone()).map_err(|e| e.to_string())?;
@@ -321,7 +240,7 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
         let mut gpu_written: Option<f64> = None;
         let mut dpm_job: Option<std::process::Child> = None;
         let mut meter = hw::RaplMeter::new();
-        let (mut cpu_meter, mut wifi_meter) = (hw::CpuMeter::new(), hw::WifiMeter::new());
+        let mut cpu_meter = hw::CpuMeter::new();
         let mut lavd = hw::Lavd::new();
         let mut clamp_due = true;
         let ncpu = std::thread::available_parallelism().map_or(1.0, |n| n.get() as f64);
@@ -359,7 +278,6 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
                         ctl.reset(&r);
                     }
                     let cmd = ctl.tick(&r);
-                    let extra = Extra { rapl, igpu: hw::igpu_mhz(), cpu, wifi: wifi_meter.read(), cores_c: r.cores_c };
                     if !shadow {
                         fans.set(cmd)?;
                         let wrote = match ctl.caps {
@@ -433,9 +351,6 @@ fn run_live(cfg: Config, cfg_dir: &Path, shadow: bool) -> Result<(), String> {
                         last = (ctl.reason, ctl.mode);
                     }
                     write_status(mode, &ctl, &r);
-                    if let Some(w) = out.as_mut() {
-                        let _ = w.write_all(csv_row(mode, &ctl, &vals, now.1, r.dgpu_active, &extra).as_bytes());
-                    }
                 }
             }
             sd_notify("WATCHDOG=1");
@@ -487,7 +402,7 @@ fn run_replay(cfg: Config, cfg_dir: &Path, path: &Path, trace: bool, mode: Optio
     let mut lines = BufReader::new(f).lines().map_while(Result::ok);
     let head: Vec<String> = lines.next().ok_or("empty CSV")?.split(',').map(str::to_owned).collect();
     let col = |n: &str| head.iter().position(|h| h == n);
-    let cols: Vec<Option<usize>> = KEYS.iter().map(|k| col(k)).collect();
+    let cols: Vec<Option<usize>> = KEYS.iter().chain(&INPUT_KEYS).map(|k| col(k)).collect();
     let t_col = col("unix_time").ok_or("no unix_time column")?;
     let rows: Vec<Vec<String>> = lines.map(|l| l.split(',').map(str::to_owned).collect()).collect();
     let first = rows.first().ok_or("no rows")?;
@@ -497,7 +412,7 @@ fn run_replay(cfg: Config, cfg_dir: &Path, path: &Path, trace: bool, mode: Optio
     };
     let model = Model::load(&cfg_dir.join(&cfg.model))?;
     let uses_pm = model.uses_pm;
-    // logger CSVs carry the fan limits; fand's own logs don't, so read this machine's
+    // extra-logger CSVs carry the fan limits; fand's old logs don't, so read this machine's
     let (lo, hi) = match (lim("F0Mn", "F1Mn"), lim("F0Mx", "F1Mx")) {
         (Ok(lo), Ok(hi)) => (lo, hi),
         _ => hw::Fans::open().map(|f| (f.lo, f.hi))?,
@@ -523,10 +438,11 @@ fn run_replay(cfg: Config, cfg_dir: &Path, path: &Path, trace: bool, mode: Optio
             .collect();
         let Some(mut r) = vals.as_deref().and_then(|v| reading(v, uses_pm).ok()) else { continue };
         r.dgpu_active = r.p.pg > 1.0;
-        r.cores_c = num(row, "cpu_core_c");
+        r.cores_c = num(row, "core_mean_c").or_else(|| num(row, "cpu_core_c"));
         r.pkg_w = num(row, "rapl_pkg_w");
         r.core_w = num(row, "rapl_core_w");
-        r.busy = num(row, "cpu_busy_pct").map(|b| b / 100.0 * ncpu);
+        // extra-logger logs count busy CPUs; fand's old logs had a percentage
+        r.busy = num(row, "busy_cpus").or_else(|| num(row, "cpu_busy_pct").map(|b| b / 100.0 * ncpu));
         let Some(t) = row.get(t_col).and_then(|s| s.parse::<f64>().ok()) else { continue };
         if prev_t.is_some_and(|p| t - p > 8.0) {
             ctl.reset(&r);

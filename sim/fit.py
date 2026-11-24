@@ -4,8 +4,8 @@
     python -m sim.fit rc3 --warm rc3-v1 --free a1_C,fan_exp --out rc3-v4
 
 The loss is free-run simulation error over whole segments (not one-step
-prediction), since the controller relies on ~90 s look-ahead. The session log
-after data.VALIDATION_START is never seen by the fit.
+prediction), since the controller relies on ~90 s look-ahead. The last part of
+each log (see sim/data.py) is never seen by the fit.
 
 The free runs are spread over one worker process per CPU: every (trial
 parameter vector, segment) run of a finite-difference Jacobian is a separate
@@ -32,7 +32,7 @@ from .thermal import TOPOLOGIES, ThermalModel, solve_outputs
 
 ROOT = Path(__file__).resolve().parent.parent
 MODELS = ROOT / "models"
-# per-log room temperature vs the stress log, K; wider bounds let the shift
+# per-log room temperature vs the reference log (the first one by name), K; wider bounds let the shift
 # soak up model error (it fit +4..+10 K for logs from the same day)
 MAX_AMBIENT_SHIFT = 3.0
 # residuals are scored every RES_STEP s (weighted by it): with 53 h of logs a
@@ -72,8 +72,8 @@ class Problem:
         self.n_dyn = len(self.specs)
         self.n_nodes = len(topo.nodes)
         self.masks = [_masks(s) for s in segs]
-        # each sample weighs the seconds it stands for (session SMC data is 10 s;
-        # elsewhere every RES_STEP-th second stands for RES_STEP)
+        # each sample weighs the seconds it stands for (every RES_STEP-th
+        # second stands for RES_STEP; sparser logs weigh their own step)
         def sampled(s, train):
             if s.step >= RES_STEP:
                 return train * s.step
@@ -90,8 +90,10 @@ class Problem:
             totals[s.source] = totals.get(s.source, 0.0) + float(w.sum())
         share = float(np.median(list(totals.values())))
         self.weights = [w * share / totals[s.source] for s, w in zip(segs, self.weights)]
-        # room temperature differs per log file; the stress log is the reference
-        self.sources = sorted({s.source for s in segs} - {"stress"})
+        # room temperature differs per log file; the first log (by name) is the reference
+        if not segs:
+            raise SystemExit("no logs to fit: record some with tools/extra-logger.py (data/extra-*.csv)")
+        self.reference, *self.sources = sorted({s.source for s in segs})
         # the residual rows of each segment
         self.rows = [np.flatnonzero(w > 0) for w in self.weights]
         # longest first, so the pool doesn't end on one long segment
@@ -289,7 +291,7 @@ def main(names, warm=None, free=None, out=None):
         print(f"\n== {name}: cost {sol.cost:.1f}, {sol.nfev} evals, {dt:.0f} s, {n_par} params ({prob.n_dyn} dynamic), status {sol.status}")
         params, shift, x0s = prob.unpack(sol.x)
         print("  " + "  ".join(f"{k}={v:.4g}" for k, v in params.items()))
-        print("  ambient shift vs stress log: " + ", ".join(f"{k} {v:+.2f} K" for k, v in shift.items()))
+        print(f"  ambient shift vs {prob.reference}: " + ", ".join(f"{k} {v:+.2f} K" for k, v in shift.items()))
         for k in smc.SENSORS:
             print(f"  {k}: w={np.round(model.out_w[k], 3)} d={model.out_d[k]:.2f}")
         print_rows(rows)

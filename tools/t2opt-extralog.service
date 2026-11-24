@@ -1,0 +1,14 @@
+[Unit]
+Description=t2opt extra logger: 1 Hz training data for the thermal model
+After=t2opt-fand.service
+# install-extra-logger.sh fills in the repo path
+RequiresMountsFor=@REPO@
+
+[Service]
+ExecStart=/usr/bin/python3 -I @REPO@/tools/extra-logger.py
+Nice=10
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
